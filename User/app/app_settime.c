@@ -197,6 +197,7 @@ void app_settime_run(key_state_t *key)
     {
         RTC_SetTime(edit_h, edit_m, edit_s);
         RTC_Save();   /* 保存到 Flash */
+        Monitor_ClearError(SYS_ERR_RTC);  /* 用户已设置时间，清除 RTC 错误标志 */
         Log_Printf("[SETTIME] saved %02d:%02d:%02d\r\n", edit_h, edit_m, edit_s);
         AppManager_GotoDesktop();
         prev_key = *key;

@@ -127,6 +127,12 @@ static void check_table_init(void)
 
 int FileSys_Init(void)
 {
+    /* 防止重复初始化（main.c 启动时已调用，app_file.c 不应再调） */
+    static int fs_inited = 0;
+    if (fs_inited)
+        return sd_ready ? 0 : -1;
+    fs_inited = 1;
+
     sdio_gpio_init();
 
     HAL_NVIC_SetPriority(SDIO_IRQn, 0x0E, 0);

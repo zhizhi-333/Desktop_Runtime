@@ -1,6 +1,9 @@
 #include "settings.h"
 #include "stm32f4xx_hal.h"
 #include "main.h"
+#include "FreeRTOS.h"
+#include "task.h"
+#include "semphr.h"
 
 /* ============================================================
  * 设置模块实现
@@ -8,6 +11,10 @@
  * Flash 存储布局：
  *   地址 0x080E0000（Sector 11）存储 settings_data_t
  *   写入前需先擦除整个扇区
+ *
+ * 同步保护: 互斥量 settings_mutex
+ *   - 多任务可能同时读写设置(MusicTask 改音量, InputTask 改其他)
+ *   - Flash 写入期间禁止读取,避免读到中间态
  * ============================================================ */
 
 /* Flash 存储地址（Sector 11 起始地址） */
@@ -19,6 +26,7 @@
 
 /* ---- 模块状态 ---- */
 static settings_data_t g_settings;
+static SemaphoreHandle_t settings_mutex = NULL;
 
 /* ---- 范围限制 ---- */
 static uint32_t clamp(uint32_t v, uint32_t lo, uint32_t hi)
@@ -100,6 +108,9 @@ static int save_to_flash(void)
 
 void Settings_Init(void)
 {
+    /* 调度器启动前创建 mutex */
+    settings_mutex = xSemaphoreCreateMutex();
+
     if (load_from_flash() != 0)
     {
         /* Flash 无有效数据，用默认值 */
@@ -166,7 +177,18 @@ int Settings_SetScreenTimeout(uint32_t v)
 
 int Settings_Save(void)
 {
-    return save_to_flash();
+    int ret;
+    /* 调度器未启动时直接写(初始化阶段) */
+    if (xTaskGetSchedulerState() == taskSCHEDULER_NOT_STARTED || settings_mutex == NULL)
+        return save_to_flash();
+
+    if (xSemaphoreTake(settings_mutex, pdMS_TO_TICKS(100)) == pdTRUE)
+    {
+        ret = save_to_flash();
+        xSemaphoreGive(settings_mutex);
+        return ret;
+    }
+    return -1;  /* 超时 */
 }
 
 void Settings_ResetDefault(void)

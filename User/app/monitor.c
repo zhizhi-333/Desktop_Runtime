@@ -12,6 +12,12 @@
 #include "key.h"
 #include "settings.h"
 #include "log_store.h"
+#include "gui.h"
+#include "lcd.h"
+#include "rtc_time.h"
+#include "file_sys.h"
+#include "file_task.h"
+#include "music_task.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -27,6 +33,9 @@ static uint32_t evt_input    = 0;   /* 输入事件计数 */
 static uint32_t evt_dropped  = 0;   /* 丢弃事件计数 */
 static uint32_t evt_error    = 0;   /* 错误计数 */
 static sys_runtime_state_t cur_state = SYS_STATE_BOOT;
+
+/* ---- 系统错误标志（位图） ---- */
+static uint32_t sys_err_flags = SYS_ERR_NONE;
 
 /* 系统状态（InputTask 顶层状态机） */
 typedef enum {
@@ -91,6 +100,11 @@ void Monitor_GetData(monitor_data_t *data)
     data->monitor_stack = (uint32_t)uxTaskGetStackHighWaterMark(monitor_task_handle);
     data->led_stack     = (uint32_t)uxTaskGetStackHighWaterMark(led_task_handle);
     data->input_stack   = (uint32_t)uxTaskGetStackHighWaterMark(input_task_handle);
+    data->file_stack    = FileTask_GetStackWatermark();
+    data->music_stack   = MusicTask_GetStackWatermark();
+    data->file_req_qwm  = (uint32_t)FileTask_GetReqWatermark();
+    data->file_resp_qwm = (uint32_t)FileTask_GetRespWatermark();
+    data->music_cmd_qwm = (uint32_t)MusicTask_GetCmdWatermark();
 }
 
 void Monitor_IncInputEvent(void)    { evt_input++; }
@@ -98,6 +112,72 @@ void Monitor_IncDroppedEvent(void)  { evt_dropped++; }
 void Monitor_IncError(void)         { evt_error++; }
 void Monitor_SetState(sys_runtime_state_t s) { cur_state = s; }
 int  Monitor_IsScreenOff(void)      { return 0; }  /* 兼容接口，实际状态由 InputTask 管理 */
+
+/* ---- 系统错误标志接口 ---- */
+void Monitor_SetError(uint32_t err_mask)
+{
+    sys_err_flags |= err_mask;
+}
+
+void Monitor_ClearError(uint32_t err_mask)
+{
+    sys_err_flags &= ~err_mask;
+}
+
+uint32_t Monitor_GetError(void)
+{
+    return sys_err_flags;
+}
+
+const char *Monitor_GetErrorString(void)
+{
+    static char buf[32];
+    if (sys_err_flags == SYS_ERR_NONE)
+        return "OK";
+
+    /* 拼接错误标识，优先级：INPUT > RTC > SD > STACK > HEAP */
+    int pos = 0;
+    if (sys_err_flags & SYS_ERR_INPUT) { buf[pos++]='I'; buf[pos++]='N'; buf[pos++]='P'; }
+    if (sys_err_flags & SYS_ERR_RTC)   { if(pos) buf[pos++]=','; buf[pos++]='R'; buf[pos++]='T'; buf[pos++]='C'; }
+    if (sys_err_flags & SYS_ERR_SD)    { if(pos) buf[pos++]=','; buf[pos++]='S'; buf[pos++]='D'; }
+    if (sys_err_flags & SYS_ERR_STACK) { if(pos) buf[pos++]=','; buf[pos++]='S'; buf[pos++]='T'; buf[pos++]='K'; }
+    if (sys_err_flags & SYS_ERR_HEAP)  { if(pos) buf[pos++]=','; buf[pos++]='H'; buf[pos++]='P'; }
+    buf[pos] = 0;
+    return buf;
+}
+
+/* ---- 启动界面：显示 LOGO 和加载信息，停留 2 秒 ---- */
+static void show_boot_screen(void)
+{
+    LCD_Clear(BLACK);
+
+    /* 顶部标题：项目名 */
+    GUI_DrawString(60, 70, "STM32F407 HMI", CYAN, BLACK, 3);
+    GUI_DrawString(120, 120, "Smart Human-Machine Interface", YELLOW, BLACK, 1);
+
+    /* 中部分隔线 */
+    LCD_Fill(60, 150, 420, 151, CYAN);
+
+    /* 加载信息行 */
+    GUI_DrawString(80, 170, "[OK] System initialized", GREEN, BLACK, 1);
+    GUI_DrawString(80, 190, "[OK] FreeRTOS started", GREEN, BLACK, 1);
+    GUI_DrawString(80, 210, "[OK] LCD driver loaded", GREEN, BLACK, 1);
+    GUI_DrawString(80, 230, "[..] Loading login...", YELLOW, BLACK, 1);
+
+    /* 底部进度条边框 */
+    GUI_DrawRect(60, 270, 360, 16, WHITE);
+    /* 进度条填充（简单一次填满，配合 2 秒停留） */
+    LCD_Fill(61, 271, 419, 285, GREEN);
+
+    /* 底部版本信息 */
+    GUI_DrawString(150, 295, "v1.0  2026", GRAY, BLACK, 1);
+
+    /* 停留 2 秒 */
+    vTaskDelay(pdMS_TO_TICKS(2000));
+
+    /* 清屏进入登录界面 */
+    LCD_Clear(BLACK);
+}
 
 /* ---- 输入任务：扫描矩阵键盘+编码器，按需刷新屏幕 UI ---- */
 static void InputTask(void *arg)
@@ -107,6 +187,64 @@ static void InputTask(void *arg)
     key_state_t key, prev_key;
     memset(&prev_key, 0, sizeof(prev_key));
     memset(&empty_key, 0, sizeof(empty_key));
+
+    /* 启动界面（停留 2 秒后进入登录） */
+    show_boot_screen();
+
+    /* ---- 初始化 RTC（移到此处避免调度器前 LSE 超时阻塞导致白屏） ---- */
+    {
+        LCD_Clear(BLACK);
+        GUI_DrawString(140, 140, "Loading RTC...", YELLOW, BLACK, 2);
+        Log_Printf("[INPUT] RTC init...\r\n");
+        RTC_Init();
+        Log_Printf("[INPUT] RTC init done: %02d:%02d:%02d\r\n",
+                   RTC_GetHour(), RTC_GetMinute(), RTC_GetSecond());
+
+        /* RTC 错误检测：首次上电（INITS=0）说明 RTC 未正常保持 */
+        {
+            extern int rtc_first_power_on;  /* rtc_time.c 中定义 */
+            if (rtc_first_power_on)
+            {
+                Monitor_SetError(SYS_ERR_RTC);
+                Log_Printf("[INPUT] RTC WARNING: first power-on, time not preserved\r\n");
+            }
+        }
+    }
+
+    /* ---- 初始化 SD 卡 + 文件系统(通过 FileTask 异步执行,不阻塞输入) ---- */
+    {
+        file_req_t req;
+        file_resp_t resp;
+        LCD_Clear(BLACK);
+        GUI_DrawString(120, 140, "Loading SD card...", YELLOW, BLACK, 2);
+        Log_Printf("[INPUT] SD card init (via FileTask)...\r\n");
+
+        memset(&req, 0, sizeof(req));
+        req.op = FILE_OP_INIT;
+        FileTask_Request(&req, pdMS_TO_TICKS(1000));
+
+        /* 阻塞等待 INIT 响应(启动阶段,用户无输入,可接受) */
+        if (FileTask_GetResponse(&resp, pdMS_TO_TICKS(5000)))
+        {
+            if (resp.result != 0)
+            {
+                Monitor_SetError(SYS_ERR_SD);
+                Log_Printf("[INPUT] SD card init FAILED (SD_ERR flag set)\r\n");
+            }
+            else
+            {
+                Log_Printf("[INPUT] SD card init OK, files=%d\r\n", FileSys_GetCount());
+            }
+        }
+        else
+        {
+            Monitor_SetError(SYS_ERR_SD);
+            Log_Printf("[INPUT] SD card init TIMEOUT\r\n");
+        }
+    }
+
+    /* 清屏进入登录 */
+    LCD_Clear(BLACK);
 
     Monitor_SetState(SYS_STATE_LOGIN);
     Login_Init();
@@ -227,6 +365,11 @@ static void InputTask(void *arg)
             Log_Printf("[INPUT] device %s (id_connected=%d)\r\n",
                        key.id_connected ? "connected" : "disconnected",
                        key.id_connected);
+            /* 更新错误标志：设备断开时设置，恢复时清除 */
+            if (key.id_connected)
+                Monitor_ClearError(SYS_ERR_INPUT);
+            else
+                Monitor_SetError(SYS_ERR_INPUT);
         }
 
         /* ---- 正常处理 ---- */
@@ -324,6 +467,7 @@ static void MonitorTask(void *arg)
 void vApplicationStackOverflowHook(TaskHandle_t xTask, char *pcTaskName)
 {
     (void)xTask;
+    sys_err_flags |= SYS_ERR_STACK;  /* 标记栈溢出错误（死循环前记录） */
     /* 用裸 UART 发送，不经过 Log_Printf（避免 mutex） */
     const char *prefix = "\r\n!!! STACK OVERFLOW in task: ";
     const char *suffix = " !!!\r\n";
@@ -336,6 +480,7 @@ void vApplicationStackOverflowHook(TaskHandle_t xTask, char *pcTaskName)
 /* ---- malloc 失败钩子 ---- */
 void vApplicationMallocFailedHook(void)
 {
+    sys_err_flags |= SYS_ERR_HEAP;  /* 标记堆分配失败 */
     const char *msg = "\r\n!!! MALLOC FAILED !!!\r\n";
     HAL_UART_Transmit(&huart3, (uint8_t*)msg, strlen(msg), 100);
 }
@@ -348,4 +493,9 @@ void Monitor_Start(void)
     xTaskCreate(LedTask,     "LED",     256, NULL, 2, &led_task_handle);
     /* InputTask 负责键盘+编码器扫描和屏幕 UI，优先级最高保证响应实时性 */
     xTaskCreate(InputTask,   "Input",   512, NULL, 3, &input_task_handle);
+
+    /* FileTask: 后台文件 I/O,优先级 2 (与 LED 同级,低于 Input) */
+    FileTask_Start();
+    /* MusicTask: 后台音乐播放,优先级 2 */
+    MusicTask_Start();
 }

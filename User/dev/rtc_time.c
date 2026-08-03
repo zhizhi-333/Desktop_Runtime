@@ -21,6 +21,7 @@
 
 static RTC_HandleTypeDef hrtc;
 static int rtc_initialized = 0;
+int rtc_first_power_on = 0;  /* 1=首次上电(INITS=0)，供外部检测 RTC 是否正常保持 */
 static int rtc_clk_src = 0;   /* 0=未知 1=LSE 2=LSI */
 
 /* ---- 初始化 RTC 外设 ---- */
@@ -84,6 +85,7 @@ static void rtc_hw_init(void)
     if (__HAL_RTC_IS_CALENDAR_INITIALIZED(&hrtc) == 0)
     {
         /* 首次上电：初始化 RTC 并设置默认时间 00:00:00 */
+        rtc_first_power_on = 1;  /* 标记首次上电，供外部错误检测使用 */
         Log_Printf("[RTC] first power-on (INITS=0), setting default 00:00:00\r\n");
         Log_Printf("[RTC] HINT: if VBAT has battery and LSE OK, next power-on should preserve time\r\n");
         HAL_RTC_Init(&hrtc);

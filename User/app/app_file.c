@@ -5,6 +5,7 @@
 #include "monitor.h"
 #include "settings.h"
 #include "file_sys.h"
+#include "file_task.h"
 #include "log_store.h"
 #include <string.h>
 #include <stdio.h>
@@ -42,6 +43,7 @@ typedef enum {
     FS_EDIT,
     FS_RENAME,
     FS_DELETE,
+    FS_WAIT,       /* 等待后台文件操作完成 */
 } file_substate_t;
 
 /* ---- 字符网格 ---- */
@@ -109,6 +111,11 @@ static int rename_error;            /* 重命名错误标志 */
 /* 删除/新建提示 */
 static int msg_timer;               /* 提示消息倒计时 */
 static char msg_text[24];
+
+/* ---- 异步操作等待状态 ---- */
+static file_op_type_t pending_op;   /* 正在等待的操作类型 */
+static file_substate_t wait_return; /* 收到响应后返回到的子状态 */
+static int wait_param;              /* 透传参数(如 sel_idx) */
 
 /* ============================================================
  * 辅助函数
@@ -286,15 +293,33 @@ static void run_list(key_state_t *key)
         draw_list();
     }
 
-    /* OK: 打开文件 */
+    /* OK: 打开文件 (异步: 先投递 READ 请求) */
     if (e_ok && count > 0)
     {
-        fs_state = FS_VIEW;
-        view_scroll = 0;
-        need_redraw = 1;
+        file_req_t req;
+        memset(&req, 0, sizeof(req));
+        req.op  = FILE_OP_READ;
+        req.idx = sel_idx;
+        req.buf = content_buf;
+        req.len = FS_FILE_MAX_SIZE;
+
+        if (FileTask_Request(&req, 0))
+        {
+            view_scroll = 0;
+            pending_op = FILE_OP_READ;
+            wait_return = FS_VIEW;
+            wait_param = sel_idx;
+            fs_state = FS_WAIT;
+            need_redraw = 1;
+        }
+        else
+        {
+            show_msg("BUSY!");
+            draw_list();
+        }
     }
 
-    /* LEFT: 新建文件 */
+    /* LEFT: 新建文件 (异步: 投递请求后切到 FS_WAIT) */
     if (e_left)
     {
         if (count >= FS_MAX_FILES)
@@ -312,17 +337,27 @@ static void run_list(key_state_t *key)
                 snprintf(name, sizeof(name), "FILE%02d.TXT", i);
                 if (!FileSys_NameExists(name))
                 {
-                    int ret = FileSys_Create(name);
-                    if (ret >= 0)
+                    file_req_t req;
+                    memset(&req, 0, sizeof(req));
+                    req.op = FILE_OP_CREATE;
+                    strncpy(req.name, name, sizeof(req.name) - 1);
+
+                    if (FileTask_Request(&req, 0))
                     {
+                        pending_op = FILE_OP_CREATE;
+                        wait_return = FS_LIST;
+                        fs_state = FS_WAIT;
+                        need_redraw = 1;
                         LogStore_FileOp("Create", name);
-                        sel_idx = FileSys_GetCount() - 1;
-                        show_msg("CREATED");
+                    }
+                    else
+                    {
+                        show_msg("BUSY!");
+                        draw_list();
                     }
                     break;
                 }
             }
-            draw_list();
         }
     }
 
@@ -344,6 +379,10 @@ static void run_list(key_state_t *key)
 
 /* ============================================================
  * VIEW 状态：查看文件内容
+ *
+ * 异步流程:
+ *   1. 进入 VIEW 时投递 READ 请求,切到 FS_WAIT
+ *   2. FS_WAIT 收到响应后 content_buf 已填充,调用 draw_view 绘制
  * ============================================================ */
 
 static void draw_view(void)
@@ -368,14 +407,11 @@ static void draw_view(void)
     snprintf(buf, sizeof(buf), "VIEW: %s [%lu B]", pretty, (unsigned long)e->size);
     GUI_DrawString(5, 8, buf, CLR_TITLE, CLR_BG, 2);  /* scale=2 放大标题 */
 
-    /* 内容显示区域 y=35~230 */
+    /* 内容显示区域 y=35~230 (content_buf 已由 FileTask 填充) */
     {
         int chars_per_line = 40;
         int line_h = 14;
         int max_lines = (230 - 35) / line_h;
-
-        /* 加载文件内容 */
-        content_len = FileSys_Read(sel_idx, content_buf, FS_FILE_MAX_SIZE);
 
         /* 逐行显示 */
         visible_chars = 0;
@@ -513,12 +549,28 @@ static void run_edit(key_state_t *key)
 
         if (idx == GRID_IDX_SAVE)
         {
-            /* 保存：写入 SD 卡 */
-            FileSys_Write(sel_idx, (uint8_t *)edit_buf, edit_len);
-            LogStore_FileOp("Write", "file");
-            fs_state = FS_VIEW;
-            view_scroll = 0;
-            need_redraw = 1;
+            /* 保存: 异步写入 SD 卡 */
+            file_req_t req;
+            memset(&req, 0, sizeof(req));
+            req.op  = FILE_OP_WRITE;
+            req.idx = sel_idx;
+            req.buf = (uint8_t *)edit_buf;
+            req.len = edit_len;
+
+            if (FileTask_Request(&req, 0))
+            {
+                pending_op = FILE_OP_WRITE;
+                wait_return = FS_VIEW;  /* 写完后重新读以刷新 content_buf */
+                wait_param = sel_idx;
+                fs_state = FS_WAIT;
+                need_redraw = 1;
+                LogStore_FileOp("Write", "file");
+            }
+            else
+            {
+                show_msg("BUSY!");
+                need_redraw = 1;
+            }
         }
         else if (idx == GRID_IDX_BACKSPACE)
         {
@@ -557,17 +609,25 @@ static void run_rename(key_state_t *key)
 
         if (idx == GRID_IDX_SAVE)
         {
-            /* 保存：检查重名后重命名 */
+            /* 保存: 异步重命名 */
+            file_req_t req;
             name_buf[name_len] = 0;
-            if (FileSys_Rename(sel_idx, name_buf) == -2)
+            memset(&req, 0, sizeof(req));
+            req.op  = FILE_OP_RENAME;
+            req.idx = sel_idx;
+            strncpy(req.name, name_buf, sizeof(req.name) - 1);
+
+            if (FileTask_Request(&req, 0))
             {
-                rename_error = 1;
-                need_redraw = 1;  /* 重名错误需全屏刷新显示提示 */
+                pending_op = FILE_OP_RENAME;
+                wait_return = FS_RENAME;  /* 留在 RENAME 状态等待结果(可能重名) */
+                wait_param = sel_idx;
+                fs_state = FS_WAIT;
+                need_redraw = 1;
             }
             else
             {
-                LogStore_FileOp("Rename", name_buf);
-                fs_state = FS_LIST;
+                show_msg("BUSY!");
                 need_redraw = 1;
             }
         }
@@ -615,6 +675,8 @@ static void run_delete(key_state_t *key)
 
     if (e_ok)
     {
+        /* 异步删除 */
+        file_req_t req;
         char pretty[13];
         const file_entry_t *e = FileSys_GetEntry(sel_idx);
         if (e)
@@ -622,11 +684,24 @@ static void run_delete(key_state_t *key)
             FileSys_PrettyName(e->name, pretty);
             LogStore_FileOp("Delete", pretty);
         }
-        FileSys_Delete(sel_idx);
-        if (sel_idx > 0) sel_idx--;
-        show_msg("DELETED");
-        fs_state = FS_LIST;
-        need_redraw = 1;
+
+        memset(&req, 0, sizeof(req));
+        req.op  = FILE_OP_DELETE;
+        req.idx = sel_idx;
+
+        if (FileTask_Request(&req, 0))
+        {
+            pending_op = FILE_OP_DELETE;
+            wait_return = FS_LIST;
+            wait_param = sel_idx;
+            fs_state = FS_WAIT;
+            need_redraw = 1;
+        }
+        else
+        {
+            show_msg("BUSY!");
+            need_redraw = 1;
+        }
     }
 
     if (e_back)
@@ -642,10 +717,10 @@ static void run_delete(key_state_t *key)
 
 void app_file_create(void)
 {
-    /* 首次进入：初始化文件系统 */
+    /* FileSys_Init 已在 InputTask 启动时执行,这里只检查结果 */
     if (!fs_initialized)
     {
-        if (FileSys_Init() != 0)
+        if (!FileSys_IsReady())
             fs_init_failed = 1;
         fs_initialized = 1;
     }
@@ -656,11 +731,122 @@ void app_file_start(void)
     need_redraw = 1;
 }
 
+/* ---- FS_WAIT 状态: 非阻塞检查后台文件操作响应 ---- */
+static void run_wait(void)
+{
+    file_resp_t resp;
+
+    /* 非阻塞取响应 */
+    if (!FileTask_GetResponse(&resp, 0))
+        return;  /* 还没完成,继续等 */
+
+    /* 收到响应,根据操作类型处理 */
+    switch (resp.op)
+    {
+        case FILE_OP_READ:
+            content_len = (resp.result >= 0) ? resp.result : 0;
+            fs_state = FS_VIEW;
+            need_redraw = 1;
+            break;
+
+        case FILE_OP_WRITE:
+            /* 写入完成,重新投递 READ 请求刷新 content_buf */
+            {
+                file_req_t req;
+                memset(&req, 0, sizeof(req));
+                req.op  = FILE_OP_READ;
+                req.idx = wait_param;
+                req.buf = content_buf;
+                req.len = FS_FILE_MAX_SIZE;
+                if (FileTask_Request(&req, 0))
+                {
+                    pending_op = FILE_OP_READ;
+                    wait_return = FS_VIEW;
+                    fs_state = FS_WAIT;
+                    need_redraw = 1;
+                }
+                else
+                {
+                    /* 投递失败,直接切回 VIEW(用旧数据) */
+                    fs_state = FS_VIEW;
+                    need_redraw = 1;
+                }
+            }
+            break;
+
+        case FILE_OP_CREATE:
+            if (resp.result >= 0)
+            {
+                sel_idx = FileSys_GetCount() - 1;
+                show_msg("CREATED");
+            }
+            else
+            {
+                show_msg("FAIL!");
+            }
+            fs_state = FS_LIST;
+            need_redraw = 1;
+            break;
+
+        case FILE_OP_DELETE:
+            if (sel_idx > 0) sel_idx--;
+            show_msg("DELETED");
+            fs_state = FS_LIST;
+            need_redraw = 1;
+            break;
+
+        case FILE_OP_RENAME:
+            if (resp.result == -2)
+            {
+                /* 重名 */
+                rename_error = 1;
+                fs_state = FS_RENAME;
+            }
+            else
+            {
+                fs_state = FS_LIST;
+            }
+            need_redraw = 1;
+            break;
+
+        default:
+            /* 异常,回到列表 */
+            fs_state = FS_LIST;
+            need_redraw = 1;
+            break;
+    }
+}
+
+/* ---- 绘制等待界面 ---- */
+static void draw_wait(void)
+{
+    const char *op_str;
+    LCD_Clear(CLR_BG);
+    switch (pending_op)
+    {
+        case FILE_OP_READ:   op_str = "Reading...";   break;
+        case FILE_OP_WRITE:  op_str = "Writing...";   break;
+        case FILE_OP_CREATE: op_str = "Creating...";  break;
+        case FILE_OP_DELETE: op_str = "Deleting...";  break;
+        case FILE_OP_RENAME: op_str = "Renaming...";  break;
+        default:             op_str = "Processing..."; break;
+    }
+    GUI_DrawString(120, 140, op_str, YELLOW, BLACK, 2);
+    GUI_DrawString(100, 180, "Please wait", CLR_HINT, BLACK, 1);
+}
+
 void app_file_run(key_state_t *key)
 {
     /* 输入事件计数 */
     if (key->ok || key->up || key->down || key->left || key->right)
         Monitor_IncInputEvent();
+
+    /* ---- FS_WAIT 优先处理(非阻塞轮询响应) ---- */
+    if (fs_state == FS_WAIT)
+    {
+        run_wait();
+        /* run_wait 可能改 fs_state,下面统一处理重绘 */
+    }
 
     /* 全屏重绘（首次进入/状态切换） */
     if (need_redraw)
@@ -672,6 +858,7 @@ void app_file_run(key_state_t *key)
             case FS_EDIT:   draw_grid_full("EDIT MODE", edit_buf, edit_len); break;
             case FS_RENAME: draw_grid_full("RENAME MODE", name_buf, name_len); break;
             case FS_DELETE: draw_delete(); break;
+            case FS_WAIT:   draw_wait(); break;
         }
         need_redraw = 0;
         need_grid_partial = 0;
@@ -691,7 +878,8 @@ void app_file_run(key_state_t *key)
      * VIEW   → 返回列表
      * EDIT   → 取消编辑，返回查看
      * RENAME → 取消重命名，返回列表
-     * DELETE → 取消删除，返回列表（已在 run_delete 处理，这里兜底） */
+     * DELETE → 取消删除，返回列表
+     * WAIT   → 不响应(操作进行中) */
     {
         uint8_t e_back = (!prev_key.back) && key->back;
         if (e_back)
@@ -722,6 +910,8 @@ void app_file_run(key_state_t *key)
                     need_redraw = 1;
                     prev_key = *key;
                     return;
+                /* FS_WAIT 不响应 BACK */
+                default: break;
             }
         }
     }
@@ -734,6 +924,8 @@ void app_file_run(key_state_t *key)
         case FS_EDIT:   run_edit(key); break;
         case FS_RENAME: run_rename(key); break;
         case FS_DELETE: run_delete(key); break;
+        /* FS_WAIT 已在上面处理 */
+        default: break;
     }
 
     prev_key = *key;

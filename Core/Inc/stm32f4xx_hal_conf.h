@@ -128,7 +128,7 @@
 #endif /* LSE_VALUE */
 
 #if !defined  (LSE_STARTUP_TIMEOUT)
-  #define LSE_STARTUP_TIMEOUT    5000U   /*!< Time out for LSE start up, in ms */
+  #define LSE_STARTUP_TIMEOUT    1000U   /*!< Time out for LSE start up, in ms (缩短：LSE 通常 200ms 内启动) */
 #endif /* LSE_STARTUP_TIMEOUT */
 
 /**

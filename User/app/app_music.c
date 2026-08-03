@@ -5,6 +5,7 @@
 #include "monitor.h"
 #include "settings.h"
 #include "music.h"
+#include "music_task.h"
 #include "dac.h"
 #include "encoder.h"
 #include <stddef.h>
@@ -289,7 +290,7 @@ void app_music_run(key_state_t *key)
     /* BACK: 停止播放并返回桌面 */
     if (e_back)
     {
-        Music_Stop();
+        MusicTask_SendCmd(MUSIC_CMD_STOP, 0, 0);
         AppManager_GotoDesktop();
         prev_key = *key;
         return;
@@ -321,22 +322,22 @@ void app_music_run(key_state_t *key)
         draw_track_list();
     }
 
-    /* ---- OK: 播放/暂停 ---- */
+    /* ---- OK: 播放/暂停 (通过队列发命令给 MusicTask) ---- */
     if (e_ok)
     {
         music_state_t st = Music_GetState();
         if (st == MUSIC_PLAYING)
         {
-            Music_Pause();
+            MusicTask_SendCmd(MUSIC_CMD_PAUSE, 0, 0);
         }
         else if (st == MUSIC_PAUSED)
         {
-            Music_Resume();
+            MusicTask_SendCmd(MUSIC_CMD_RESUME, 0, 0);
         }
         else  /* IDLE 或 FINISHED */
         {
-            Music_Load(sel_track);
-            Music_Play();
+            MusicTask_SendCmd(MUSIC_CMD_LOAD, sel_track, 0);
+            MusicTask_SendCmd(MUSIC_CMD_PLAY, 0, 0);
         }
         need_info_update = 1;
     }
@@ -344,7 +345,7 @@ void app_music_run(key_state_t *key)
     /* ---- 编码器按压: 停止 ---- */
     if (e_ecsw)
     {
-        Music_Stop();
+        MusicTask_SendCmd(MUSIC_CMD_STOP, 0, 0);
         need_info_update = 1;
     }
 
@@ -352,24 +353,17 @@ void app_music_run(key_state_t *key)
     if (enc_delta > 0)
     {
         uint8_t vol = DAC_GetVolume();
-        if (vol < 100) { vol++; Music_SetVolume(vol); Settings_SetVolume(vol); }
+        if (vol < 100) { vol++; MusicTask_SendCmd(MUSIC_CMD_VOLUME, vol, 0); Settings_SetVolume(vol); }
         need_info_update = 1;
     }
     else if (enc_delta < 0)
     {
         uint8_t vol = DAC_GetVolume();
-        if (vol > 0) { vol--; Music_SetVolume(vol); Settings_SetVolume(vol); }
+        if (vol > 0) { vol--; MusicTask_SendCmd(MUSIC_CMD_VOLUME, vol, 0); Settings_SetVolume(vol); }
         need_info_update = 1;
     }
 
-    /* ---- 推进播放 ---- */
-    if (Music_GetState() == MUSIC_PLAYING)
-    {
-        if (Music_Update())
-            need_info_update = 1;
-    }
-
-    /* ---- 检测状态/音符变化 ---- */
+    /* ---- 播放推进由 MusicTask 后台执行,这里只检测状态变化 ---- */
     {
         music_state_t cur_state = Music_GetState();
         int cur_note = Music_GetCurrentNoteIdx();
@@ -382,12 +376,6 @@ void app_music_run(key_state_t *key)
         }
     }
 
-    /* ---- 播放完毕自动停止 ---- */
-    if (Music_GetState() == MUSIC_FINISHED)
-    {
-        /* 保持 FINISHED 状态显示,不自动切回 IDLE */
-    }
-
     /* ---- 增量刷新信息区(只重绘变化部分, 避免闪烁) ---- */
     draw_info_dynamic();
 
@@ -397,6 +385,6 @@ void app_music_run(key_state_t *key)
 void app_music_pause(void)
 {
     /* 被切换走:停止播放,避免后台发声 */
-    Music_Stop();
+    MusicTask_SendCmd(MUSIC_CMD_STOP, 0, 0);
     need_redraw = 1;
 }

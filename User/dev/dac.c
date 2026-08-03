@@ -1,6 +1,9 @@
 #include "dac.h"
 #include "stm32f4xx_hal.h"
 #include "usart.h"
+#include "FreeRTOS.h"
+#include "task.h"
+#include "semphr.h"
 
 /* ============================================================
  * DAC1_CH1 (PA4) 驱动实现
@@ -13,14 +16,21 @@
  * 简化实现:
  *   - 用 TIM6 中断回调翻转 DAC 输出值 (高/低电平)
  *   - 音量通过调整高电平幅度实现 (0~2047)
+ *
+ * 同步保护: 互斥量 dac_mutex
+ *   - MusicTask 调用 DAC_Start/Stop/SetFreq
+ *   - app_music 读取 DAC_GetVolume/IsPlaying
+ *   - TIM6 中断读取 playing/volume/toggle
+ *   - mutex 保护任务侧访问,中断侧读 volatile 变量(无需锁)
  * ============================================================ */
 
 static DAC_HandleTypeDef hdac;
 static TIM_HandleTypeDef htim6;
-static uint8_t volume = 50;          /* 当前音量 0~100 */
-static int playing = 0;              /* 是否在播放 */
-static uint8_t toggle = 0;           /* 方波翻转标志 */
-static volatile uint32_t dac_isr_count = 0;  /* TIM6 中断计数(诊断用) */
+static volatile uint8_t volume = 50;          /* 当前音量 0~100 (volatile: 中断读取) */
+static volatile int playing = 0;              /* 是否在播放 (volatile: 中断读取) */
+static uint8_t toggle = 0;                    /* 方波翻转标志 */
+static volatile uint32_t dac_isr_count = 0;   /* TIM6 中断计数(诊断用) */
+static SemaphoreHandle_t dac_mutex = NULL;    /* 任务侧互斥量 */
 
 /* ---- TIM6 中断回调 ---- */
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
@@ -77,6 +87,10 @@ void DAC_Init(void)
 
     Log_Printf("[DAC] DAC_Init start\r\n");
 
+    /* 创建互斥量(调度器可能未启动,但 xSemaphoreCreateMutex 在启动前也可用) */
+    if (dac_mutex == NULL)
+        dac_mutex = xSemaphoreCreateMutex();
+
     dac_gpio_init();
     Log_Printf("[DAC] GPIO PA4 configured (analog)\r\n");
 
@@ -109,6 +123,8 @@ void DAC_Init(void)
 /* ---- 设置输出频率 ---- */
 void DAC_SetFreq(uint32_t freq)
 {
+    uint32_t arr;
+
     if (freq == 0)
     {
         DAC_Stop();
@@ -119,7 +135,6 @@ void DAC_SetFreq(uint32_t freq)
      * TIM6 频率 = 84MHz / (Prescaler+1) / (Period+1)
      * 触发频率 = 2 * freq
      * 简化: Prescaler=0, Period = 84MHz / (2 * freq) - 1 */
-    uint32_t arr;
     if (freq < 100) freq = 100;
     if (freq > 5000) freq = 5000;
 
@@ -127,31 +142,63 @@ void DAC_SetFreq(uint32_t freq)
     if (arr == 0) arr = 1;
     if (arr > 65535) arr = 65535;
 
+    /* ARR 寄存器写入是原子的,且 TIM6 有 preload,无需加锁 */
     __HAL_TIM_SET_AUTORELOAD(&htim6, arr - 1);
 }
 
 /* ---- 开始播放 ---- */
 void DAC_Start(void)
 {
-    if (!playing)
+    if (xTaskGetSchedulerState() == taskSCHEDULER_NOT_STARTED || dac_mutex == NULL)
     {
-        playing = 1;
-        toggle = 0;
-        dac_isr_count = 0;
-        HAL_TIM_Base_Start_IT(&htim6);
-        Log_Printf("[DAC] DAC_Start: TIM6 interrupt started\r\n");
+        if (!playing)
+        {
+            playing = 1;
+            toggle = 0;
+            dac_isr_count = 0;
+            HAL_TIM_Base_Start_IT(&htim6);
+        }
+        return;
+    }
+
+    if (xSemaphoreTake(dac_mutex, pdMS_TO_TICKS(50)) == pdTRUE)
+    {
+        if (!playing)
+        {
+            playing = 1;
+            toggle = 0;
+            dac_isr_count = 0;
+            HAL_TIM_Base_Start_IT(&htim6);
+            Log_Printf("[DAC] DAC_Start: TIM6 interrupt started\r\n");
+        }
+        xSemaphoreGive(dac_mutex);
     }
 }
 
 /* ---- 停止播放 ---- */
 void DAC_Stop(void)
 {
-    if (playing)
+    if (xTaskGetSchedulerState() == taskSCHEDULER_NOT_STARTED || dac_mutex == NULL)
     {
-        playing = 0;
-        HAL_TIM_Base_Stop_IT(&htim6);
-        HAL_DAC_SetValue(&hdac, DAC_CHANNEL_1, DAC_ALIGN_12B_R, 2048);  /* 静音 */
-        Log_Printf("[DAC] DAC_Stop: ISR fired %u times\r\n", dac_isr_count);
+        if (playing)
+        {
+            playing = 0;
+            HAL_TIM_Base_Stop_IT(&htim6);
+            HAL_DAC_SetValue(&hdac, DAC_CHANNEL_1, DAC_ALIGN_12B_R, 2048);
+        }
+        return;
+    }
+
+    if (xSemaphoreTake(dac_mutex, pdMS_TO_TICKS(50)) == pdTRUE)
+    {
+        if (playing)
+        {
+            playing = 0;
+            HAL_TIM_Base_Stop_IT(&htim6);
+            HAL_DAC_SetValue(&hdac, DAC_CHANNEL_1, DAC_ALIGN_12B_R, 2048);  /* 静音 */
+            Log_Printf("[DAC] DAC_Stop: ISR fired %u times\r\n", dac_isr_count);
+        }
+        xSemaphoreGive(dac_mutex);
     }
 }
 
@@ -159,6 +206,7 @@ void DAC_Stop(void)
 void DAC_SetVolume(uint8_t vol)
 {
     if (vol > 100) vol = 100;
+    /* volume 是 volatile uint8_t,单字节写入原子,无需加锁 */
     volume = vol;
 }
 

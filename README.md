@@ -26,18 +26,20 @@ microcomputer/
 │   │   ├── desktop.c           # 桌面界面（应用图标选择）
 │   │   ├── login.c             # 登录/锁屏界面（密码输入、错误锁定）
 │   │   ├── monitor.c           # 系统监控任务（状态机、熄屏/唤醒、输入分发）
-│   │   ├── settings.c          # 设置持久化（光标大小、灵敏度等）
+│   │   ├── settings.c          # 设置持久化（音量、屏幕超时，Flash Sector 11）
 │   │   ├── gui.c               # GUI 工具库（字符串、按钮、矩形绘制）
-│   │   ├── log_store.c         # 日志存储（SD 卡日志）
+│   │   ├── log_store.c         # 日志存储（环形缓冲，互斥锁保护）
 │   │   ├── input_test.c        # 输入测试
 │   │   ├── app_draw.c          # 绘图应用（编码器选色、按键清屏）
-│   │   ├── app_file.c          # 文件管理应用（SD 卡文件增删改查）
+│   │   ├── app_file.c          # 文件管理应用（SD 卡文件增删改查，异步 I/O）
 │   │   ├── file_sys.c          # 文件系统（SD 卡 Block 0 文件表管理）
+│   │   ├── file_task.c         # 文件后台任务（队列驱动，避免输入阻塞）
 │   │   ├── app_music.c         # 音乐播放应用（曲目选择、进度显示）
 │   │   ├── music.c             # 音乐播放器（DAC 方波合成、音量控制）
+│   │   ├── music_task.c        # 音乐后台任务（队列驱动，独立推进播放）
 │   │   ├── app_settime.c       # 时间设置应用
-│   │   ├── app_settings.c      # 设置应用（光标参数调整）
-│   │   ├── app_sysmonitor.c    # 系统监控应用（堆/栈/事件计数）
+│   │   ├── app_settings.c      # 设置应用（音量、屏幕超时调整）
+│   │   ├── app_sysmonitor.c    # 系统监控应用（堆/栈/队列水位、错误计数）
 │   │   └── app_log.c           # 日志查看应用
 │   │
 │   └── dev/                    # 设备驱动层
@@ -87,8 +89,8 @@ microcomputer/
 | **MUSIC** | 音乐播放器，DAC 方波合成，音量可调且掉电保存 |
 | **FILE** | SD 卡文件管理（创建/查看/编辑/删除/重命名，8.3 文件名，512 字节/文件） |
 | **SETTIME** | 时间设置（时/分/秒） |
-| **SETTINGS** | 系统设置（光标大小、灵敏度） |
-| **SYSMON** | 系统监控（运行时间、堆/栈水位、事件计数） |
+| **SETTINGS** | 系统设置（音量、屏幕超时） |
+| **SYSMON** | 系统监控（堆/栈水位、队列水位、错误计数） |
 | **LOG** | 日志查看 |
 
 ### 安全特性
@@ -134,18 +136,70 @@ microcomputer/
 
 ## 关键技术
 
-### FreeRTOS 任务
-| 任务 | 优先级 | 栈大小 | 功能 |
-|------|--------|--------|------|
-| MonitorTask | 5 | 1024 | 状态机、熄屏/唤醒、输入分发 |
-| InputTask | 4 | 1024 | 矩阵键盘扫描 + 编码器读取 |
-| LedTask | 3 | 256 | LED 指示（心跳/状态） |
+### FreeRTOS 多任务架构
+
+系统拆分为 5 个任务，按"输入最优先、I/O 次之、监控最低"原则分配优先级，避免后台操作阻塞输入响应与界面刷新。
+
+| 任务 | 优先级 | 栈大小(字) | 周期 | 职责 |
+|------|--------|-----------|------|------|
+| **InputTask** | 3（最高） | 512 | 20ms | 矩阵键盘+编码器扫描、状态机（LOGIN/RUNTIME/SCREEN_OFF/LOCKED）、熄屏唤醒、应用分发、UI 重绘 |
+| **FileTask** | 2 | 1024 | 事件驱动 | SD 卡块读写、文件增删改查，通过请求/响应队列与 InputTask 解耦 |
+| **MusicTask** | 2 | 512 | 20ms | 音符推进、DAC 频率切换，通过命令队列接收 app_music 指令 |
+| **LedTask** | 2 | 256 | 500ms | LED 翻转，肉眼确认调度器运行 |
+| **MonitorTask** | 1（最低） | 1024 | 1000ms | 堆/栈水位采样、最小堆记录、串口健康日志 |
+
+**优先级设计理由**
+- InputTask 最高：人机交互系统对输入延迟最敏感，20ms 周期必须保证
+- FileTask/MusicTask/LedTask 同级（2）：均为后台 I/O，无硬实时要求；同优先级由 FreeRTOS 时间片轮转
+- MonitorTask 最低：日志打印和统计可延后，绝不抢占功能任务
+
+### 任务间通信
+
+| 通信通道 | 类型 | 生产者 | 消费者 | 说明 |
+|---------|------|--------|--------|------|
+| `file_req_queue` | 队列(4 深) | app_file (InputTask) | FileTask | 文件操作请求（READ/WRITE/CREATE/DELETE/RENAME/INIT） |
+| `file_resp_queue` | 队列(4 深) | FileTask | app_file (InputTask) | 操作结果回传，app_file 非阻塞轮询 |
+| `music_cmd_queue` | 队列(4 深) | app_music (InputTask) | MusicTask | 播放命令（LOAD/PLAY/PAUSE/RESUME/STOP/VOLUME） |
+
+**设计理由**
+- 队列实现自然解耦：InputTask 投递请求后立即返回，不等待 SD 卡 I/O 完成
+- app_file 引入 `FS_WAIT` 子状态，每帧用 `FileTask_GetResponse(0)` 非阻塞检查，收到响应才推进状态机
+- 队列长度 4 兼顾突发性与内存占用，队列水位通过 SYSMONITOR 可视化
+
+### 共享资源同步保护
+
+| 共享资源 | 同步原语 | 保护范围 | 加锁策略 |
+|---------|---------|---------|---------|
+| 日志缓冲区 `log_store` | 互斥量 `log_mutex` | add_entry / GetCount / GetEntry | 50ms 超时，调度器未启动时直写 |
+| 系统设置 `settings` | 互斥量 `settings_mutex` | Settings_Save (Flash 擦写) | 100ms 超时，Flash 写入期间串行化 |
+| DAC/音频输出 `dac` | 互斥量 `dac_mutex` | DAC_Start / DAC_Stop | 50ms 超时，TIM6 中断读 volatile 变量无需锁 |
+| 文件表 `file_sys` | 隐式串行 | 所有 FileSys_* 调用 | 仅 FileTask 单任务访问，天然无竞争 |
+
+**设计理由**
+- 互斥量而非临界区：保护范围可能跨 SD 卡 I/O（数百 ms），临界区会禁用调度伤害实时性
+- volatile + 单字节写：DAC 的 `volume`/`playing` 为单字节，ARM 单字节写原子，中断侧直接读 volatile 免锁
+- 超时兜底：所有 `xSemaphoreTake` 均带超时，避免死锁时永久卡死任务
+
+### 异常与边界处理
+
+| 场景 | 处理策略 |
+|------|---------|
+| 栈溢出 | `configCHECK_FOR_STACK_OVERFLOW=2` + `vApplicationStackOverflowHook` 设置 `SYS_ERR_STACK` 并串口告警 |
+| 堆分配失败 | `vApplicationMallocFailedHook` 设置 `SYS_ERR_HEAP` |
+| SD 卡缺失 | FileTask 返回 `result<0`，桌面状态栏显示 `ERR:SD`，FILE 应用显示 `[NO SD!]` |
+| 队列满 | `FileTask_Request` 返回 0，app_file 显示 `BUSY!` 提示 |
+| 文件数满 | `FS_MAX_FILES=16` 检测，显示 `FULL!` |
+| RTC 首次上电 | INITS 标志检测，设置 `SYS_ERR_RTC`，SETTIME 应用清除 |
+| 输入设备断开 | PE6 ID 脚检测，设置 `SYS_ERR_INPUT`，状态栏显示 `ERR:INP` |
+| 高频输入抖动 | 20ms 周期去抖 + `Monitor_IncDroppedEvent` 计数 |
 
 ### RTC 实时时钟
 - LSE 32.768kHz 外部晶振（精度高）
 - VBAT 纽扣电池维持掉电走时
 - 首次上电自动检测 INITS 标志，避免覆盖已保存时间
 - LSE 启动失败自动回退到 LSI
+- **LSE 超时设为 1000ms**（非默认 5000ms），避免调度器启动前阻塞导致白屏
+- RTC 初始化移至 InputTask（调度器启动后），避免 main.c 中 LSE 超时阻塞
 
 ### SD 卡文件系统
 - Block 0 存储文件表（16 个文件条目）

@@ -32,6 +32,11 @@ typedef struct {
     uint32_t    monitor_stack;      /* Monitor 栈剩余（字） */
     uint32_t    led_stack;          /* LED 栈剩余（字） */
     uint32_t    input_stack;        /* Input 栈剩余（字） */
+    uint32_t    file_stack;         /* FileTask 栈剩余（字） */
+    uint32_t    music_stack;        /* MusicTask 栈剩余（字） */
+    uint32_t    file_req_qwm;       /* 文件请求队列水位 */
+    uint32_t    file_resp_qwm;      /* 文件响应队列水位 */
+    uint32_t    music_cmd_qwm;      /* 音乐命令队列水位 */
 } monitor_data_t;
 
 /* 获取监控数据快照 */
@@ -53,5 +58,28 @@ void Monitor_SetState(sys_runtime_state_t state);
 
 /* 查询屏幕是否熄灭（1=熄屏, 0=亮屏） */
 int Monitor_IsScreenOff(void);
+
+/* ============================================================
+ * 系统错误标志接口（供桌面状态栏显示错误提示）
+ * ============================================================ */
+
+/* 系统错误码（位图，可同时存在多个错误） */
+#define SYS_ERR_NONE            0x00
+#define SYS_ERR_INPUT           0x01    /* 输入设备断开 */
+#define SYS_ERR_RTC             0x02    /* RTC 异常（时间未保持/初始化失败） */
+#define SYS_ERR_SD              0x04    /* SD 卡异常 */
+#define SYS_ERR_STACK           0x08    /* 栈溢出（曾经发生） */
+#define SYS_ERR_HEAP            0x10    /* 堆分配失败（曾经发生） */
+
+/* 设置/清除错误标志 */
+void Monitor_SetError(uint32_t err_mask);
+void Monitor_ClearError(uint32_t err_mask);
+
+/* 获取当前错误标志（位图） */
+uint32_t Monitor_GetError(void);
+
+/* 获取错误提示字符串（用于桌面状态栏显示） */
+/* 返回: 指向静态字符串的指针，无错误时返回 "OK" */
+const char *Monitor_GetErrorString(void);
 
 #endif /* MONITOR_H */

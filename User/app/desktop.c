@@ -4,6 +4,7 @@
 #include "lcd.h"
 #include "settings.h"
 #include "rtc_time.h"
+#include "monitor.h"
 #include "FreeRTOS.h"
 #include "task.h"
 #include <stddef.h>
@@ -63,14 +64,56 @@ static key_state_t prev_key;
 static int need_redraw;
 static int last_sec = -1;           /* 上次显示的秒数(检测变化) */
 static int last_id_conn = -1;       /* 上次输入设备状态 */
+static uint32_t last_err_flags = 0xFFFFFFFF; /* 上次错误标志(初始值故意不同以触发首次刷新) */
+
+/* ---- 拖动状态 ---- */
+static int drag_active = 0;         /* 是否正在拖动图标 */
+static int drag_icon_idx = -1;      /* 被拖动的图标索引 */
+static int drag_moved = 0;          /* 拖动期间是否发生过移动(用于区分点击vs拖动) */
+static int16_t drag_off_x, drag_off_y; /* 按下时光标相对图标左上角的偏移 */
+
+/* ---- 图标位置表（支持拖动后改变位置） ---- */
+#define MAX_ICONS 16
+static int16_t icon_pos_x[MAX_ICONS];
+static int16_t icon_pos_y[MAX_ICONS];
+static int icon_pos_initialized = 0;
 
 /* ---- 获取图标位置 ---- */
 static void get_icon_pos(int idx, uint16_t *x, uint16_t *y)
 {
-    int col = idx % ICON_COLS;
-    int row = idx / ICON_COLS;
-    *x = ICON_X0 + col * (ICON_W + ICON_GAP_X);
-    *y = ICON_Y0 + row * (ICON_H + ICON_GAP_Y);
+    if (idx < 0 || idx >= MAX_ICONS)
+    {
+        *x = 0; *y = 0;
+        return;
+    }
+    /* 首次访问时用网格位置初始化 */
+    if (!icon_pos_initialized)
+    {
+        int i;
+        for (i = 0; i < MAX_ICONS; i++)
+        {
+            int col = i % ICON_COLS;
+            int row = i / ICON_COLS;
+            icon_pos_x[i] = ICON_X0 + col * (ICON_W + ICON_GAP_X);
+            icon_pos_y[i] = ICON_Y0 + row * (ICON_H + ICON_GAP_Y);
+        }
+        icon_pos_initialized = 1;
+    }
+    *x = icon_pos_x[idx];
+    *y = icon_pos_y[idx];
+}
+
+/* ---- 设置图标位置（拖动时调用，带边界限制） ---- */
+static void set_icon_pos(int idx, int16_t x, int16_t y)
+{
+    if (idx < 0 || idx >= MAX_ICONS) return;
+    /* 限制图标在桌面区域内（不能压到标题和状态栏） */
+    if (x < 0) x = 0;
+    if (y < 30) y = 30;  /* 避开顶部标题区 */
+    if (x + ICON_W > SCR_W) x = SCR_W - ICON_W;
+    if (y + ICON_H > STATUS_Y - 1) y = STATUS_Y - 1 - ICON_H;
+    icon_pos_x[idx] = x;
+    icon_pos_y[idx] = y;
 }
 
 /* ---- 画单个图标 ---- */
@@ -115,7 +158,7 @@ static void draw_desktop(void)
 }
 
 /* ---- 画状态栏 ---- */
-/* 布局: [8] +cursor  [120] TIME: HH:MM:SS  [280] INPUT: OK/NC  [380] APP: NAME
+/* 布局: [8] +cursor  [70] TIME: HH:MM:SS  [180] INPUT:OK/NC  [270] ERR:xxx
  * full=1: 全量重绘(首次进入/设备状态变化/光标覆盖恢复)
  * full=0: 仅局部刷新时间区域(每秒调用，避免整行闪烁) */
 static void draw_status_bar(int full)
@@ -129,16 +172,25 @@ static void draw_status_bar(int full)
         GUI_DrawString(20, STATUS_Y, "cursor", CLR_STATUS, CLR_BG, 1);
 
         if (prev_key.id_connected)
-            GUI_DrawString(280, STATUS_Y, "INPUT: OK", CLR_STATUS, CLR_BG, 1);
+            GUI_DrawString(180, STATUS_Y, "INPUT:OK", CLR_STATUS, CLR_BG, 1);
         else
-            GUI_DrawString(280, STATUS_Y, "INPUT: NC", YELLOW, CLR_BG, 1);
+            GUI_DrawString(180, STATUS_Y, "INPUT:NC", YELLOW, CLR_BG, 1);
     }
 
-    /* 时间区域局部刷新（x=120 到 x=230，避免清除其他元素） */
-    LCD_Fill(120, STATUS_Y, 230, SCR_H - 1, CLR_BG);
-    snprintf(buf, sizeof(buf), "TIME: %02d:%02d:%02d",
+    /* 时间区域局部刷新（x=70 到 x=165，避免清除其他元素） */
+    LCD_Fill(70, STATUS_Y, 165, SCR_H - 1, CLR_BG);
+    snprintf(buf, sizeof(buf), "%02d:%02d:%02d",
              RTC_GetHour(), RTC_GetMinute(), RTC_GetSecond());
-    GUI_DrawString(120, STATUS_Y, buf, CLR_STATUS, CLR_BG, 1);
+    GUI_DrawString(70, STATUS_Y, buf, CLR_STATUS, CLR_BG, 1);
+
+    /* 错误提示区域（x=270 到 x=470，每次刷新） */
+    {
+        const char *errstr = Monitor_GetErrorString();
+        uint16_t errcolor = (Monitor_GetError() == SYS_ERR_NONE) ? CLR_STATUS : RED;
+        LCD_Fill(270, STATUS_Y, SCR_W - 1, SCR_H - 1, CLR_BG);
+        snprintf(buf, sizeof(buf), "ERR:%s", errstr);
+        GUI_DrawString(270, STATUS_Y, buf, errcolor, CLR_BG, 1);
+    }
 }
 
 /* ---- 画十字光标 ---- */
@@ -260,17 +312,19 @@ int Desktop_Run(key_state_t *key)
     }
 
     /* 状态栏定期刷新：
-     * - 设备状态变化 -> 全量重绘(full=1)
+     * - 设备状态变化或错误标志变化 -> 全量重绘(full=1)
      * - 仅秒数变化 -> 局部刷新时间区域(full=0)，避免整行闪烁 */
     {
         int cur_sec = RTC_GetSecond();
         int cur_id = key->id_connected;
-        if (cur_id != last_id_conn)
+        uint32_t cur_err = Monitor_GetError();
+        if (cur_id != last_id_conn || cur_err != last_err_flags)
         {
             prev_key = *key;  /* 让 draw_status_bar 读到新的 id_connected */
             draw_status_bar(1);
             last_sec = cur_sec;
             last_id_conn = cur_id;
+            last_err_flags = cur_err;
             draw_cursor(cursor_x, cursor_y);
         }
         else if (cur_sec != last_sec)
@@ -284,7 +338,24 @@ int Desktop_Run(key_state_t *key)
     /* 记录旧选中状态 */
     cursor_on_icon(&old_sel);
 
-    /* 光标移动 */
+    /* ---- 拖动逻辑 ---- */
+    /* OK 按下：如果在图标上，记录潜在拖动 */
+    if (e_ok && !drag_active)
+    {
+        int sel = -1;
+        if (cursor_on_icon(&sel))
+        {
+            uint16_t ix, iy;
+            drag_active = 1;
+            drag_icon_idx = sel;
+            drag_moved = 0;
+            get_icon_pos(sel, &ix, &iy);
+            drag_off_x = cursor_x - ix;
+            drag_off_y = cursor_y - iy;
+        }
+    }
+
+    /* 光标移动（拖动时也响应，用于移动图标） */
     if (e_left)  { cursor_x -= CURSOR_STEP; moved = 1; }
     if (e_right) { cursor_x += CURSOR_STEP; moved = 1; }
     if (e_up)    { cursor_y -= CURSOR_STEP; moved = 1; }
@@ -297,19 +368,48 @@ int Desktop_Run(key_state_t *key)
         if (cursor_x >= SCR_W) cursor_x = SCR_W - 1;
         if (cursor_y >= SCR_H) cursor_y = SCR_H - 1;
 
+        /* 拖动中：移动图标位置 */
+        if (drag_active && drag_icon_idx >= 0)
+        {
+            int16_t new_x = cursor_x - drag_off_x;
+            int16_t new_y = cursor_y - drag_off_y;
+            /* 擦除旧位置：先填背景再重绘 */
+            uint16_t ox, oy;
+            get_icon_pos(drag_icon_idx, &ox, &oy);
+            LCD_Fill(ox, oy, ox + ICON_W - 1, oy + ICON_H - 1, CLR_BG);
+            /* 设置新位置并重绘图标 + 光标 */
+            set_icon_pos(drag_icon_idx, new_x, new_y);
+            draw_icon(drag_icon_idx, 1);
+            /* 标记已移动（释放时不启动应用） */
+            drag_moved = 1;
+        }
+
         restore_cursor_area(prev_cx, prev_cy);
         draw_cursor(cursor_x, cursor_y);
         prev_cx = cursor_x;
         prev_cy = cursor_y;
     }
 
-    /* OK 键：选中图标启动应用 */
-    if (e_ok)
+    /* OK 释放：根据是否移动决定是启动应用还是结束拖动 */
+    if (prev_key.ok && !key->ok)
     {
-        if (cursor_on_icon(&new_sel))
+        if (drag_active)
         {
-            prev_key = *key;
-            return new_sel;   /* 通知 AppManager 启动应用 */
+            if (!drag_moved)
+            {
+                /* 没移动 → 当作点击：启动应用 */
+                new_sel = drag_icon_idx;
+                drag_active = 0;
+                drag_icon_idx = -1;
+                prev_key = *key;
+                return new_sel;   /* 通知 AppManager 启动应用 */
+            }
+            else
+            {
+                /* 移动过 → 结束拖动，保持新位置 */
+                drag_active = 0;
+                drag_icon_idx = -1;
+            }
         }
     }
 

@@ -31,6 +31,7 @@
 #include "log_store.h"
 #include "encoder.h"
 #include "rtc_time.h"
+#include "file_sys.h"
 #include "FreeRTOS.h"
 #include "task.h"
 /* USER CODE END Includes */
@@ -117,10 +118,14 @@ int main(void)
   Settings_Init();
   Log_Printf("[BOOT] Settings loaded\r\n");
 
-  /* 初始化软件时钟（从 Flash 读取上次时间） */
-  RTC_Init();
-  Log_Printf("[BOOT] RTC time loaded: %02d:%02d:%02d\r\n",
-             RTC_GetHour(), RTC_GetMinute(), RTC_GetSecond());
+  /* 注意：RTC 初始化移到 InputTask 中执行（启动界面之后）
+   * 原因：RTC_Init 内部调用 HAL_RCC_OscConfig 启动 LSE 晶振，
+   * 若无 LSE 晶振会阻塞等待超时（最长 1 秒），在调度器启动前调用
+   * 会导致屏幕白屏（LCD 已初始化但启动界面无法显示）。在任务中调用则有调度器保底 */
+
+  /* 注意：SD 卡初始化也移到 InputTask 中执行（启动界面之后）
+   * 原因：HAL_SD_Init 在无卡时会长时间阻塞，若在调度器启动前调用
+   * 会导致系统卡死、屏幕白屏。在任务中调用则有调度器保底 */
 
   /* 初始化日志存储（环形缓冲区） */
   LogStore_Init();
