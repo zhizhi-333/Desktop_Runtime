@@ -1,0 +1,43 @@
+# ===== Keil MDK 编译产物 =====
+MDK-ARM/microcomputer/
+MDK-ARM/build.log
+MDK-ARM/*.uvguix.*
+MDK-ARM/*.uvoptx
+MDK-ARM/RTE/_microcomputer/
+
+# *.o *.d *.axf *.hex *.map *.lnp *.sct *.htm *.dep 等中间文件
+*.o
+*.d
+*.axf
+*.hex
+*.map
+*.lnp
+*.sct
+*.dep
+*.build_log.htm
+*.crf
+*.iex
+*.lst
+
+# ===== IDE 配置文件 =====
+*.bak
+*.ddk
+*.edk
+*.pbi
+*.poi
+*.sim
+
+# ===== VSCode / Eclipse 等 =====
+.vscode/
+.settings/
+Debug/
+Release/
+
+# ===== 系统文件 =====
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ===== 保留 Keil 工程文件本身 =====
+!MDK-ARM/microcomputer.uvprojx
+!MDK-ARM/startup_stm32f407xx.s
