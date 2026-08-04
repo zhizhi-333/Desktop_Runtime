@@ -77,4 +77,8 @@ int FileTask_GetRespWatermark(void);   /* 响应队列当前等待数 */
 /* 查询任务栈剩余(字,供 SYSMONITOR 显示) */
 uint32_t FileTask_GetStackWatermark(void);
 
+/* 查询任务运行状态(供 SYSMONITOR 显示)
+ * 返回 eTaskState: eRunning/eReady/eBlocked/eSuspended/eDeleted */
+eTaskState FileTask_GetState(void);
+
 #endif /* FILE_TASK_H */

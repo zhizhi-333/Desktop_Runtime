@@ -1,5 +1,6 @@
 #include "file_sys.h"
 #include "stm32f4xx_hal.h"
+#include "usart.h"
 #include <string.h>
 #include <stdio.h>
 
@@ -8,7 +9,14 @@
  *
  * 文件表缓存在内存中，修改后调用 save_table() 写回 SD 卡
  * 文件数据直接读写 SD 卡对应块
+ *
+ * 存储一致性保护:
+ *   save_table 写入文件表(Block 0)后, 计算 CRC32 并写入 Block 17
+ *   load_table 读取后校验 CRC, 不匹配则告警并清理损坏条目
  * ============================================================ */
+
+/* 文件表 CRC 校验块魔数 "FST1" */
+#define FS_TABLE_MAGIC  0x46535431u
 
 /* ---- SD 卡句柄（模块内部） ---- */
 static SD_HandleTypeDef hsd;
@@ -16,6 +24,63 @@ static int sd_ready;                /* SD 卡是否就绪 */
 
 /* ---- 文件表缓存（内存中） ---- */
 static file_entry_t table[FS_MAX_FILES];
+
+/* ---- 文件表 CRC 损坏标志(load_table 检测到, FileSys_Init 据此重写) ---- */
+static int table_crc_corrupted = 0;
+
+/* ---- 底层块读写前向声明(供 CRC 校验函数使用) ---- */
+static int read_block(uint32_t block, uint8_t *buf);
+static int write_block(uint32_t block, const uint8_t *buf);
+
+/* ---- CRC32 (多项式 0xEDB88320, 与 zlib/zip 一致) ----
+ * 用于校验文件表数据完整性, 防止掉电写入不完整导致文件表损坏 */
+static uint32_t fs_crc32(const uint8_t *data, int len)
+{
+    uint32_t crc = 0xFFFFFFFFu;
+    int i;
+    for (i = 0; i < len; i++)
+    {
+        crc ^= data[i];
+        int b;
+        for (b = 0; b < 8; b++)
+        {
+            if (crc & 1u)
+                crc = (crc >> 1) ^ 0xEDB88320u;
+            else
+                crc = (crc >> 1);
+        }
+    }
+    return ~crc;
+}
+
+/* ---- 写入文件表 CRC 校验块到 Block 17 ---- */
+static int save_table_crc(uint32_t crc)
+{
+    uint8_t buf[512];
+    uint32_t *p = (uint32_t *)buf;
+
+    memset(buf, 0, sizeof(buf));
+    p[0] = FS_TABLE_MAGIC;
+    p[1] = crc;
+    return write_block(FS_BLOCK_TABLE_CRC, buf);
+}
+
+/* ---- 读取并校验文件表 CRC, 返回 0=匹配, 1=无CRC(首次), -1=不匹配 ---- */
+static int verify_table_crc(const uint8_t *table_buf)
+{
+    uint8_t buf[512];
+    uint32_t *p = (uint32_t *)buf;
+    uint32_t computed;
+
+    if (read_block(FS_BLOCK_TABLE_CRC, buf) != 0)
+        return 1;  /* 读取失败(首次使用), 视为无 CRC */
+
+    if (p[0] != FS_TABLE_MAGIC)
+        return 1;  /* 无魔数(首次使用), 视为无 CRC */
+
+    computed = fs_crc32(table_buf, 512);
+    return (p[1] == computed) ? 0 : -1;
+}
 
 /* ---- SDIO GPIO 初始化 ---- */
 static void sdio_gpio_init(void)
@@ -66,24 +131,108 @@ static int write_block(uint32_t block, const uint8_t *buf)
     return 0;
 }
 
-/* ---- 把内存中的文件表写回 SD 卡 ---- */
+/* ---- 底层块读写公共接口（供画图等应用直接存储数据） ---- */
+int FileSys_ReadRawBlock(uint32_t block, uint8_t *buf)
+{
+    return read_block(block, buf);
+}
+
+/* 前向声明: save_table 定义在后面，CreateDraw 需要先调用 */
+static int save_table(void);
+
+int FileSys_WriteRawBlock(uint32_t block, const uint8_t *buf)
+{
+    return write_block(block, buf);
+}
+
+/* ---- 创建或更新绘图文件条目 ---- */
+int FileSys_CreateDraw(const char *name, uint16_t block_addr, uint32_t size)
+{
+    char formatted[FS_NAME_LEN];
+    int i;
+
+    FileSys_FormatName(name, formatted);
+
+    /* 先查找是否已存在同名绘图文件 */
+    for (i = 0; i < FS_MAX_FILES; i++)
+    {
+        if (table[i].used && memcmp(table[i].name, formatted, 11) == 0)
+        {
+            /* 已存在: 更新 size 和 block_addr */
+            table[i].size       = size;
+            table[i].block_addr = block_addr;
+            table[i].type       = FS_TYPE_DRAW;
+            table[i].state      = FS_STATE_NORMAL;
+            save_table();
+            return i;
+        }
+    }
+
+    /* 不存在: 找空闲槽位创建 */
+    for (i = 0; i < FS_MAX_FILES; i++)
+    {
+        if (!table[i].used)
+        {
+            memset(&table[i], 0, sizeof(file_entry_t));
+            memcpy(table[i].name, formatted, 11);
+            table[i].size       = size;
+            table[i].used       = 1;
+            table[i].type       = FS_TYPE_DRAW;
+            table[i].block_addr = block_addr;
+            table[i].state      = FS_STATE_NORMAL;
+            save_table();
+            return i;
+        }
+    }
+
+    return -1;  /* 已满 */
+}
+
+/* ---- 把内存中的文件表写回 SD 卡, 并更新 CRC 校验块 ---- */
 static int save_table(void)
 {
     uint8_t buf[512];
 
     memset(buf, 0, sizeof(buf));
     memcpy(buf, table, sizeof(table));
-    return write_block(FS_BLOCK_TABLE, buf);
+    if (write_block(FS_BLOCK_TABLE, buf) != 0)
+        return -1;
+
+    /* 写入 CRC 校验块(Block 17), 保证文件表掉电可识别 */
+    save_table_crc(fs_crc32(buf, 512));
+    return 0;
 }
 
-/* ---- 从 SD 卡加载文件表到内存 ---- */
+/* ---- 从 SD 卡加载文件表到内存, 并校验 CRC ---- */
 static int load_table(void)
 {
     uint8_t buf[512];
 
     if (read_block(FS_BLOCK_TABLE, buf) != 0)
         return -1;
-    memcpy(table, buf, sizeof(table));
+
+    /* CRC 校验: 识别掉电/写入不完整导致的文件表损坏 */
+    {
+        int crc_ret = verify_table_crc(buf);
+        if (crc_ret == 0)
+        {
+            /* CRC 匹配: 数据完整 */
+            memcpy(table, buf, sizeof(table));
+        }
+        else if (crc_ret == 1)
+        {
+            /* 无 CRC(首次使用或旧版数据): 正常加载, 后续 save_table 会建立 CRC */
+            memcpy(table, buf, sizeof(table));
+            Log_Printf("[FS] table CRC not present (first use), will create\r\n");
+        }
+        else
+        {
+            /* CRC 不匹配: 文件表可能损坏, 加载后由 check_table_init 清理异常条目 */
+            memcpy(table, buf, sizeof(table));
+            table_crc_corrupted = 1;
+            Log_Printf("[FS] !!! table CRC mismatch! data may be corrupted, sanitizing !!!\r\n");
+        }
+    }
     return 0;
 }
 
@@ -164,6 +313,13 @@ int FileSys_Init(void)
     else
     {
         check_table_init();
+        /* CRC 损坏后: 清理完异常条目, 重写文件表 + 新 CRC, 避免持续使用损坏数据 */
+        if (table_crc_corrupted)
+        {
+            save_table();
+            table_crc_corrupted = 0;
+            Log_Printf("[FS] table re-saved with fresh CRC after corruption\r\n");
+        }
     }
 
     return 0;
@@ -308,6 +464,9 @@ int FileSys_Create(const char *name)
             memcpy(table[i].name, formatted, 11);
             table[i].size = 0;
             table[i].used = 1;
+            table[i].type = FS_TYPE_TEXT;              /* 默认文本类型 */
+            table[i].block_addr = FS_BLOCK_DATA_BASE + i;  /* 存储位置 */
+            table[i].state = FS_STATE_NORMAL;          /* 正常状态 */
 
             if (save_table() != 0)
                 return -1;

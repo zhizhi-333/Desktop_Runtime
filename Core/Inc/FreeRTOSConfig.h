@@ -102,6 +102,7 @@ to exclude the API function. */
 #define INCLUDE_uxTaskGetStackHighWaterMark  1
 #define INCLUDE_xTaskGetSchedulerState 1
 #define INCLUDE_xTaskGetHandle          1
+#define INCLUDE_eTaskGetState           1
 
 /* 调试辅助：允许 vTaskList / vTaskGetRunTimeStats 格式化输出 */
 #define configUSE_STATS_FORMATTING_FUNCTIONS  1

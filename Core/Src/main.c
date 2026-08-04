@@ -131,6 +131,9 @@ int main(void)
   LogStore_Init();
   Log_Printf("[BOOT] LogStore initialized\r\n");
 
+  /* 初始化看门狗 (IWDG) - 在调度器启动前,MonitorTask 启动后接管喂狗 */
+  Monitor_WDG_Init();
+
   /* 创建监控任务和 LED 任务 */
   Log_Printf("[BOOT] Monitor_Start\r\n");
   Monitor_Start();

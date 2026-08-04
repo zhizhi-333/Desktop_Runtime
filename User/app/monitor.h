@@ -37,6 +37,18 @@ typedef struct {
     uint32_t    file_req_qwm;       /* 文件请求队列水位 */
     uint32_t    file_resp_qwm;      /* 文件响应队列水位 */
     uint32_t    music_cmd_qwm;      /* 音乐命令队列水位 */
+    char        task_states[6];     /* 5 个任务运行状态字符 + null */
+    /* 顺序: [0]=Monitor [1]=LED [2]=Input [3]=File [4]=Music */
+    /* 字符: R=Running r=Ready B=Blocked S=Suspended D=Deleted */
+    /* ---- 运行负载分析: 历史峰值(MonitorTask 每秒更新) ---- */
+    uint32_t    min_monitor_stack;  /* Monitor 栈历史最小值(最大使用) */
+    uint32_t    min_led_stack;      /* LED 栈历史最小值 */
+    uint32_t    min_input_stack;    /* Input 栈历史最小值 */
+    uint32_t    min_file_stack;     /* FileTask 栈历史最小值 */
+    uint32_t    min_music_stack;    /* MusicTask 栈历史最小值 */
+    uint32_t    peak_file_req_qwm;  /* 文件请求队列历史峰值 */
+    uint32_t    peak_file_resp_qwm; /* 文件响应队列历史峰值 */
+    uint32_t    peak_music_cmd_qwm; /* 音乐命令队列历史峰值 */
 } monitor_data_t;
 
 /* 获取监控数据快照 */
@@ -70,6 +82,7 @@ int Monitor_IsScreenOff(void);
 #define SYS_ERR_SD              0x04    /* SD 卡异常 */
 #define SYS_ERR_STACK           0x08    /* 栈溢出（曾经发生） */
 #define SYS_ERR_HEAP            0x10    /* 堆分配失败（曾经发生） */
+#define SYS_ERR_TASK_HANG       0x20    /* 任务卡死（看门狗检测到,即将复位） */
 
 /* 设置/清除错误标志 */
 void Monitor_SetError(uint32_t err_mask);
@@ -81,5 +94,36 @@ uint32_t Monitor_GetError(void);
 /* 获取错误提示字符串（用于桌面状态栏显示） */
 /* 返回: 指向静态字符串的指针，无错误时返回 "OK" */
 const char *Monitor_GetErrorString(void);
+
+/* ============================================================
+ * 看门狗 (IWDG) + 任务心跳检测
+ *
+ * 原理:
+ *   - IWDG 硬件看门狗: 超时未喂狗则整个系统复位
+ *   - 软件任务心跳: 每个任务在循环中调用 Monitor_Heartbeat()
+ *     MonitorTask 每秒检查 5 个心跳计数是否变化
+ *     若某任务 5 秒内心跳无变化 -> 判定卡死, 停止喂狗 -> IWDG 复位
+ *
+ * 使用:
+ *   - 启动: Monitor_WDG_Init() (在 main.c 调度器启动前)
+ *   - 各任务循环中: Monitor_Heartbeat(task_id)
+ *   - 喂狗由 MonitorTask 自动完成(检测到所有任务健康时)
+ * ============================================================ */
+
+/* 任务 ID (用于心跳上报) */
+typedef enum {
+    HB_MONITOR = 0,
+    HB_LED,
+    HB_INPUT,
+    HB_FILE,
+    HB_MUSIC,
+    HB_TASK_COUNT,          /* 任务总数(=5) */
+} hb_task_id_t;
+
+/* 初始化 IWDG 硬件看门狗(在 main.c 调度器启动前调用一次) */
+void Monitor_WDG_Init(void);
+
+/* 任务心跳上报(各任务在主循环中调用) */
+void Monitor_Heartbeat(hb_task_id_t id);
 
 #endif /* MONITOR_H */

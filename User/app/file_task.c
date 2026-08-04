@@ -36,9 +36,12 @@ static void FileTask(void *arg)
 
     for (;;)
     {
-        /* 阻塞等待请求 */
-        if (xQueueReceive(file_req_queue, &req, portMAX_DELAY) != pdTRUE)
+        /* 等待请求(有限超时,确保即使无请求也能定期喂心跳) */
+        if (xQueueReceive(file_req_queue, &req, pdMS_TO_TICKS(1000)) != pdTRUE)
+        {
+            Monitor_Heartbeat(HB_FILE);  /* 空转也喂心跳,防止看门狗误判 */
             continue;
+        }
 
         memset(&resp, 0, sizeof(resp));
         resp.op  = req.op;
@@ -83,6 +86,9 @@ static void FileTask(void *arg)
                 resp.result = -1;
                 break;
         }
+
+        /* 心跳上报(发送响应前,避免队列满阻塞时心跳停滞) */
+        Monitor_Heartbeat(HB_FILE);
 
         /* 发送响应(阻塞等待,因为响应队列必须及时腾空) */
         xQueueSend(file_resp_queue, &resp, portMAX_DELAY);
@@ -134,4 +140,11 @@ uint32_t FileTask_GetStackWatermark(void)
 {
     if (file_task_handle == NULL) return 0;
     return (uint32_t)uxTaskGetStackHighWaterMark(file_task_handle);
+}
+
+/* ---- 任务运行状态 ---- */
+eTaskState FileTask_GetState(void)
+{
+    if (file_task_handle == NULL) return eDeleted;
+    return eTaskGetState(file_task_handle);
 }

@@ -5,21 +5,25 @@
 #include "lcd.h"
 #include "key.h"
 #include <stddef.h>
+#include <string.h>
 
 /* ============================================================
  * 系统监控应用
  *
- * 显示内容：
- *   - 运行时间（HH:MM:SS）
- *   - 当前系统状态（LOGIN/DESKTOP/APP）
- *   - 剩余堆 / 历史最小堆
- *   - 任务栈水位（Monitor/LED/Input）
- *   - 事件计数（输入/丢弃/错误）
+ * 两页显示（按 OK 切换）：
+ *   Page 0 - 实时数据：
+ *     - 运行时间 / 系统状态 / 剩余堆 / 最小堆
+ *     - 各任务栈水位(当前) / 队列水位(当前)
+ *     - 事件计数 / 错误计数 / 任务运行状态
+ *   Page 1 - 历史峰值(运行负载分析)：
+ *     - 各任务栈历史最小值(=最大使用量)
+ *     - 各队列历史峰值
+ *     - 错误计数 / 任务运行状态
  *
  * 刷新策略：
- *   - 进入时全屏重绘
+ *   - 进入/切页时全屏重绘
  *   - 运行中每 500ms 局部刷新数据（避免闪烁）
- *   - 按 BACK 返回桌面（由 AppManager 处理）
+ *   - OK 切页, BACK 返回桌面
  * ============================================================ */
 
 /* 颜色定义 */
@@ -29,17 +33,19 @@
 #define CLR_VALUE       GREEN
 #define CLR_WARN        YELLOW
 #define CLR_ERROR       RED
+#define CLR_PEAK        MAGENTA     /* 历史峰值用品红区分 */
 
 /* 布局 */
 #define SCR_W   480
 #define SCR_H   320
-#define ROW_H   18      /* 每行高度(调小以容纳更多行) */
+#define ROW_H   17      /* 每行高度(调小以容纳更多行) */
 #define COL1_X  20      /* 标签列 */
 #define COL2_X  180     /* 数值列 */
 #define START_Y 48      /* 起始 Y */
 
 /* ---- 模块状态 ---- */
 static int need_redraw;
+static int cur_page = 0;        /* 0=实时数据, 1=历史峰值 */
 static uint32_t last_refresh;   /* 上次刷新的 tick */
 static monitor_data_t last_data; /* 上次显示的数据（用于对比变化） */
 static key_state_t prev_key;
@@ -88,6 +94,11 @@ static void draw_row(uint16_t y, const char *label, const char *value, uint16_t 
 static void draw_title(void)
 {
     GUI_DrawString(20, 12, "SYSTEM MONITOR", CLR_TITLE, CLR_BG, 2);
+    /* 右上角: 页码 + 操作提示 */
+    if (cur_page == 0)
+        GUI_DrawString(SCR_W - 260, 18, "[OK]Peaks  [BACK]Exit", CLR_LABEL, CLR_BG, 1);
+    else
+        GUI_DrawString(SCR_W - 260, 18, "[OK]Live   [BACK]Exit", CLR_LABEL, CLR_BG, 1);
     /* 分隔线 */
     LCD_Fill(20, 38, SCR_W - 20, 39, CLR_TITLE);
 }
@@ -103,7 +114,7 @@ static void draw_row_num(uint16_t y, const char *label, uint32_t value,
         GUI_DrawString(COL2_X + 80, y + 3, unit, CLR_LABEL, CLR_BG, 1);
 }
 
-/* ---- 全屏重绘 ---- */
+/* ---- 全屏重绘(按当前页) ---- */
 static void redraw_all(const monitor_data_t *d)
 {
     char buf[32];
@@ -111,152 +122,257 @@ static void redraw_all(const monitor_data_t *d)
     LCD_Clear(CLR_BG);
     draw_title();
 
-    /* 运行时间 */
-    format_uptime(d->uptime_sec, buf);
-    draw_row(START_Y + 0 * ROW_H, "Uptime:", buf, CLR_VALUE);
+    if (cur_page == 0)
+    {
+        /* ===== Page 0: 实时数据 ===== */
+        format_uptime(d->uptime_sec, buf);
+        draw_row(START_Y + 0 * ROW_H, "Uptime:", buf, CLR_VALUE);
+        draw_row(START_Y + 1 * ROW_H, "State:", state_str(d->state), CLR_VALUE);
+        draw_row_num(START_Y + 2 * ROW_H, "FreeHeap:", (uint32_t)d->free_heap, CLR_VALUE, "B");
+        draw_row_num(START_Y + 3 * ROW_H, "MinHeap:", (uint32_t)d->min_heap, CLR_WARN, "B");
+        draw_row_num(START_Y + 4 * ROW_H, "MonStack:", d->monitor_stack, CLR_VALUE, "W");
+        draw_row_num(START_Y + 5 * ROW_H, "LedStack:", d->led_stack, CLR_VALUE, "W");
+        draw_row_num(START_Y + 6 * ROW_H, "InpStack:", d->input_stack, CLR_VALUE, "W");
+        draw_row_num(START_Y + 7 * ROW_H, "FileStack:", d->file_stack, CLR_VALUE, "W");
+        draw_row_num(START_Y + 8 * ROW_H, "MusicStack:", d->music_stack, CLR_VALUE, "W");
+        draw_row_num(START_Y + 9 * ROW_H, "FileReqQ:", d->file_req_qwm, CLR_VALUE, "");
+        draw_row_num(START_Y + 10 * ROW_H, "FileRespQ:", d->file_resp_qwm, CLR_VALUE, "");
+        draw_row_num(START_Y + 11 * ROW_H, "MusicCmdQ:", d->music_cmd_qwm, CLR_VALUE, "");
+        draw_row_num(START_Y + 12 * ROW_H, "InpEvents:", d->input_events, CLR_VALUE, "");
+        draw_row_num(START_Y + 13 * ROW_H, "DrpEvents:", d->dropped_events, CLR_WARN, "");
+        draw_row_num(START_Y + 14 * ROW_H, "Errors:", d->error_count,
+                     (d->error_count > 0) ? CLR_ERROR : CLR_VALUE, "");
+        draw_row(START_Y + 15 * ROW_H, "TaskState:", d->task_states, CLR_VALUE);
+    }
+    else
+    {
+        /* ===== Page 1: 历史峰值(运行负载分析) ===== */
+        /* 顶部保留运行时间/状态/堆作为上下文参考 */
+        format_uptime(d->uptime_sec, buf);
+        draw_row(START_Y + 0 * ROW_H, "Uptime:", buf, CLR_VALUE);
+        draw_row_num(START_Y + 1 * ROW_H, "FreeHeap:", (uint32_t)d->free_heap, CLR_VALUE, "B");
+        draw_row_num(START_Y + 2 * ROW_H, "MinHeap:", (uint32_t)d->min_heap, CLR_WARN, "B");
 
-    /* 系统状态 */
-    draw_row(START_Y + 1 * ROW_H, "State:", state_str(d->state), CLR_VALUE);
+        /* 分组标题 */
+        GUI_DrawString(COL1_X, START_Y + 3 * ROW_H + 3,
+                       "-- Min Stack (max usage) --", CLR_PEAK, CLR_BG, 1);
 
-    /* 剩余堆 */
-    draw_row_num(START_Y + 2 * ROW_H, "FreeHeap:", (uint32_t)d->free_heap, CLR_VALUE, "B");
+        /* 各任务栈历史最小值(=最大使用量), 用峰值色高亮 */
+        draw_row_num(START_Y + 4 * ROW_H, "MonMinStk:", d->min_monitor_stack, CLR_PEAK, "W");
+        draw_row_num(START_Y + 5 * ROW_H, "LedMinStk:", d->min_led_stack, CLR_PEAK, "W");
+        draw_row_num(START_Y + 6 * ROW_H, "InpMinStk:", d->min_input_stack, CLR_PEAK, "W");
+        draw_row_num(START_Y + 7 * ROW_H, "FileMinStk:", d->min_file_stack, CLR_PEAK, "W");
+        draw_row_num(START_Y + 8 * ROW_H, "MusicMinStk:", d->min_music_stack, CLR_PEAK, "W");
 
-    /* 最小堆 */
-    draw_row_num(START_Y + 3 * ROW_H, "MinHeap:", (uint32_t)d->min_heap, CLR_WARN, "B");
+        /* 分组标题 */
+        GUI_DrawString(COL1_X, START_Y + 9 * ROW_H + 3,
+                       "-- Peak Queue --", CLR_PEAK, CLR_BG, 1);
 
-    /* 栈水位 - Monitor */
-    draw_row_num(START_Y + 4 * ROW_H, "MonStack:", d->monitor_stack, CLR_VALUE, "W");
+        draw_row_num(START_Y + 10 * ROW_H, "FileReqPk:", d->peak_file_req_qwm, CLR_PEAK, "");
+        draw_row_num(START_Y + 11 * ROW_H, "FileRespPk:", d->peak_file_resp_qwm, CLR_PEAK, "");
+        draw_row_num(START_Y + 12 * ROW_H, "MusicCmdPk:", d->peak_music_cmd_qwm, CLR_PEAK, "");
 
-    /* 栈水位 - LED */
-    draw_row_num(START_Y + 5 * ROW_H, "LedStack:", d->led_stack, CLR_VALUE, "W");
+        /* 底部: 错误计数 + 任务状态 */
+        draw_row_num(START_Y + 13 * ROW_H, "Errors:", d->error_count,
+                     (d->error_count > 0) ? CLR_ERROR : CLR_VALUE, "");
+        draw_row(START_Y + 14 * ROW_H, "TaskState:", d->task_states, CLR_VALUE);
 
-    /* 栈水位 - Input */
-    draw_row_num(START_Y + 6 * ROW_H, "InpStack:", d->input_stack, CLR_VALUE, "W");
-
-    /* 栈水位 - FileTask */
-    draw_row_num(START_Y + 7 * ROW_H, "FileStack:", d->file_stack, CLR_VALUE, "W");
-
-    /* 栈水位 - MusicTask */
-    draw_row_num(START_Y + 8 * ROW_H, "MusicStack:", d->music_stack, CLR_VALUE, "W");
-
-    /* 队列水位 - 文件请求 */
-    draw_row_num(START_Y + 9 * ROW_H, "FileReqQ:", d->file_req_qwm, CLR_VALUE, "");
-
-    /* 队列水位 - 文件响应 */
-    draw_row_num(START_Y + 10 * ROW_H, "FileRespQ:", d->file_resp_qwm, CLR_VALUE, "");
-
-    /* 队列水位 - 音乐命令 */
-    draw_row_num(START_Y + 11 * ROW_H, "MusicCmdQ:", d->music_cmd_qwm, CLR_VALUE, "");
-
-    /* 输入事件 */
-    draw_row_num(START_Y + 12 * ROW_H, "InpEvents:", d->input_events, CLR_VALUE, "");
-
-    /* 丢弃事件 */
-    draw_row_num(START_Y + 13 * ROW_H, "DrpEvents:", d->dropped_events, CLR_WARN, "");
-
-    /* 错误计数 */
-    draw_row_num(START_Y + 14 * ROW_H, "Errors:", d->error_count,
-                 (d->error_count > 0) ? CLR_ERROR : CLR_VALUE, "");
-
-    /* 底部提示 */
-    GUI_DrawString(20, SCR_H - 16, "[BACK] to desktop", CLR_LABEL, CLR_BG, 1);
+        /* 说明: 峰值自启动起累计, 栈最小值越小=使用越深 */
+        GUI_DrawString(COL1_X, START_Y + 15 * ROW_H + 3,
+                       "* lower=min deeper used", CLR_LABEL, CLR_BG, 1);
+    }
 }
 
-/* ---- 局部刷新（只更新变化的行）---- */
+/* ---- 局部刷新（只更新当前页变化的行）---- */
 static void refresh_data(const monitor_data_t *d)
 {
     char buf[32];
     uint16_t y;
 
-    /* 运行时间（总会变） */
-    format_uptime(d->uptime_sec, buf);
-    y = START_Y + 0 * ROW_H;
-    LCD_Fill(COL2_X, y, SCR_W - 1, y + ROW_H - 1, CLR_BG);
-    GUI_DrawString(COL2_X, y + 3, buf, CLR_VALUE, CLR_BG, 1);
+    if (cur_page == 0)
+    {
+        /* ===== Page 0: 实时数据 ===== */
+        format_uptime(d->uptime_sec, buf);
+        y = START_Y + 0 * ROW_H;
+        LCD_Fill(COL2_X, y, SCR_W - 1, y + ROW_H - 1, CLR_BG);
+        GUI_DrawString(COL2_X, y + 3, buf, CLR_VALUE, CLR_BG, 1);
 
-    /* 系统状态（可能变化） */
-    if (d->state != last_data.state)
-    {
-        y = START_Y + 1 * ROW_H;
-        LCD_Fill(COL2_X, y, SCR_W - 1, y + ROW_H - 1, CLR_BG);
-        GUI_DrawString(COL2_X, y + 3, state_str(d->state), CLR_VALUE, CLR_BG, 1);
+        if (d->state != last_data.state)
+        {
+            y = START_Y + 1 * ROW_H;
+            LCD_Fill(COL2_X, y, SCR_W - 1, y + ROW_H - 1, CLR_BG);
+            GUI_DrawString(COL2_X, y + 3, state_str(d->state), CLR_VALUE, CLR_BG, 1);
+        }
+        if (d->free_heap != last_data.free_heap)
+        {
+            y = START_Y + 2 * ROW_H;
+            LCD_Fill(COL2_X, y, SCR_W - 1, y + ROW_H - 1, CLR_BG);
+            GUI_DrawNum(COL2_X, y + 3, (uint32_t)d->free_heap, CLR_VALUE, CLR_BG, 1);
+        }
+        if (d->min_heap != last_data.min_heap)
+        {
+            y = START_Y + 3 * ROW_H;
+            LCD_Fill(COL2_X, y, SCR_W - 1, y + ROW_H - 1, CLR_BG);
+            GUI_DrawNum(COL2_X, y + 3, (uint32_t)d->min_heap, CLR_WARN, CLR_BG, 1);
+        }
+        if (d->monitor_stack != last_data.monitor_stack)
+        {
+            y = START_Y + 4 * ROW_H;
+            LCD_Fill(COL2_X, y, SCR_W - 1, y + ROW_H - 1, CLR_BG);
+            GUI_DrawNum(COL2_X, y + 3, d->monitor_stack, CLR_VALUE, CLR_BG, 1);
+        }
+        if (d->led_stack != last_data.led_stack)
+        {
+            y = START_Y + 5 * ROW_H;
+            LCD_Fill(COL2_X, y, SCR_W - 1, y + ROW_H - 1, CLR_BG);
+            GUI_DrawNum(COL2_X, y + 3, d->led_stack, CLR_VALUE, CLR_BG, 1);
+        }
+        if (d->input_stack != last_data.input_stack)
+        {
+            y = START_Y + 6 * ROW_H;
+            LCD_Fill(COL2_X, y, SCR_W - 1, y + ROW_H - 1, CLR_BG);
+            GUI_DrawNum(COL2_X, y + 3, d->input_stack, CLR_VALUE, CLR_BG, 1);
+        }
+        if (d->file_stack != last_data.file_stack)
+        {
+            y = START_Y + 7 * ROW_H;
+            LCD_Fill(COL2_X, y, SCR_W - 1, y + ROW_H - 1, CLR_BG);
+            GUI_DrawNum(COL2_X, y + 3, d->file_stack, CLR_VALUE, CLR_BG, 1);
+        }
+        if (d->music_stack != last_data.music_stack)
+        {
+            y = START_Y + 8 * ROW_H;
+            LCD_Fill(COL2_X, y, SCR_W - 1, y + ROW_H - 1, CLR_BG);
+            GUI_DrawNum(COL2_X, y + 3, d->music_stack, CLR_VALUE, CLR_BG, 1);
+        }
+        if (d->file_req_qwm != last_data.file_req_qwm)
+        {
+            y = START_Y + 9 * ROW_H;
+            LCD_Fill(COL2_X, y, SCR_W - 1, y + ROW_H - 1, CLR_BG);
+            GUI_DrawNum(COL2_X, y + 3, d->file_req_qwm, CLR_VALUE, CLR_BG, 1);
+        }
+        if (d->file_resp_qwm != last_data.file_resp_qwm)
+        {
+            y = START_Y + 10 * ROW_H;
+            LCD_Fill(COL2_X, y, SCR_W - 1, y + ROW_H - 1, CLR_BG);
+            GUI_DrawNum(COL2_X, y + 3, d->file_resp_qwm, CLR_VALUE, CLR_BG, 1);
+        }
+        if (d->music_cmd_qwm != last_data.music_cmd_qwm)
+        {
+            y = START_Y + 11 * ROW_H;
+            LCD_Fill(COL2_X, y, SCR_W - 1, y + ROW_H - 1, CLR_BG);
+            GUI_DrawNum(COL2_X, y + 3, d->music_cmd_qwm, CLR_VALUE, CLR_BG, 1);
+        }
+        if (d->input_events != last_data.input_events)
+        {
+            y = START_Y + 12 * ROW_H;
+            LCD_Fill(COL2_X, y, SCR_W - 1, y + ROW_H - 1, CLR_BG);
+            GUI_DrawNum(COL2_X, y + 3, d->input_events, CLR_VALUE, CLR_BG, 1);
+        }
+        if (d->dropped_events != last_data.dropped_events)
+        {
+            y = START_Y + 13 * ROW_H;
+            LCD_Fill(COL2_X, y, SCR_W - 1, y + ROW_H - 1, CLR_BG);
+            GUI_DrawNum(COL2_X, y + 3, d->dropped_events, CLR_WARN, CLR_BG, 1);
+        }
+        if (d->error_count != last_data.error_count)
+        {
+            y = START_Y + 14 * ROW_H;
+            LCD_Fill(COL2_X, y, SCR_W - 1, y + ROW_H - 1, CLR_BG);
+            GUI_DrawNum(COL2_X, y + 3, d->error_count,
+                        (d->error_count > 0) ? CLR_ERROR : CLR_VALUE, CLR_BG, 1);
+        }
+        if (memcmp(d->task_states, last_data.task_states, 6) != 0)
+        {
+            y = START_Y + 15 * ROW_H;
+            LCD_Fill(COL2_X, y, SCR_W - 1, y + ROW_H - 1, CLR_BG);
+            GUI_DrawString(COL2_X, y + 3, d->task_states, CLR_VALUE, CLR_BG, 1);
+        }
     }
+    else
+    {
+        /* ===== Page 1: 历史峰值 ===== */
+        /* 运行时间(总会变) */
+        format_uptime(d->uptime_sec, buf);
+        y = START_Y + 0 * ROW_H;
+        LCD_Fill(COL2_X, y, SCR_W - 1, y + ROW_H - 1, CLR_BG);
+        GUI_DrawString(COL2_X, y + 3, buf, CLR_VALUE, CLR_BG, 1);
 
-    /* 剩余堆（可能变化） */
-    if (d->free_heap != last_data.free_heap)
-    {
-        y = START_Y + 2 * ROW_H;
-        LCD_Fill(COL2_X, y, SCR_W - 1, y + ROW_H - 1, CLR_BG);
-        GUI_DrawNum(COL2_X, y + 3, (uint32_t)d->free_heap, CLR_VALUE, CLR_BG, 1);
-    }
-
-    /* 最小堆（可能变化） */
-    if (d->min_heap != last_data.min_heap)
-    {
-        y = START_Y + 3 * ROW_H;
-        LCD_Fill(COL2_X, y, SCR_W - 1, y + ROW_H - 1, CLR_BG);
-        GUI_DrawNum(COL2_X, y + 3, (uint32_t)d->min_heap, CLR_WARN, CLR_BG, 1);
-    }
-
-    /* 栈水位（可能变化） */
-    if (d->monitor_stack != last_data.monitor_stack)
-    {
-        y = START_Y + 4 * ROW_H;
-        LCD_Fill(COL2_X, y, SCR_W - 1, y + ROW_H - 1, CLR_BG);
-        GUI_DrawNum(COL2_X, y + 3, d->monitor_stack, CLR_VALUE, CLR_BG, 1);
-    }
-    if (d->led_stack != last_data.led_stack)
-    {
-        y = START_Y + 5 * ROW_H;
-        LCD_Fill(COL2_X, y, SCR_W - 1, y + ROW_H - 1, CLR_BG);
-        GUI_DrawNum(COL2_X, y + 3, d->led_stack, CLR_VALUE, CLR_BG, 1);
-    }
-    if (d->input_stack != last_data.input_stack)
-    {
-        y = START_Y + 6 * ROW_H;
-        LCD_Fill(COL2_X, y, SCR_W - 1, y + ROW_H - 1, CLR_BG);
-        GUI_DrawNum(COL2_X, y + 3, d->input_stack, CLR_VALUE, CLR_BG, 1);
-    }
-
-    /* 队列水位（可能变化） */
-    if (d->file_req_qwm != last_data.file_req_qwm)
-    {
-        y = START_Y + 9 * ROW_H;
-        LCD_Fill(COL2_X, y, SCR_W - 1, y + ROW_H - 1, CLR_BG);
-        GUI_DrawNum(COL2_X, y + 3, d->file_req_qwm, CLR_VALUE, CLR_BG, 1);
-    }
-    if (d->file_resp_qwm != last_data.file_resp_qwm)
-    {
-        y = START_Y + 10 * ROW_H;
-        LCD_Fill(COL2_X, y, SCR_W - 1, y + ROW_H - 1, CLR_BG);
-        GUI_DrawNum(COL2_X, y + 3, d->file_resp_qwm, CLR_VALUE, CLR_BG, 1);
-    }
-    if (d->music_cmd_qwm != last_data.music_cmd_qwm)
-    {
-        y = START_Y + 11 * ROW_H;
-        LCD_Fill(COL2_X, y, SCR_W - 1, y + ROW_H - 1, CLR_BG);
-        GUI_DrawNum(COL2_X, y + 3, d->music_cmd_qwm, CLR_VALUE, CLR_BG, 1);
-    }
-
-    /* 事件计数（可能变化） */
-    if (d->input_events != last_data.input_events)
-    {
-        y = START_Y + 12 * ROW_H;
-        LCD_Fill(COL2_X, y, SCR_W - 1, y + ROW_H - 1, CLR_BG);
-        GUI_DrawNum(COL2_X, y + 3, d->input_events, CLR_VALUE, CLR_BG, 1);
-    }
-    if (d->dropped_events != last_data.dropped_events)
-    {
-        y = START_Y + 13 * ROW_H;
-        LCD_Fill(COL2_X, y, SCR_W - 1, y + ROW_H - 1, CLR_BG);
-        GUI_DrawNum(COL2_X, y + 3, d->dropped_events, CLR_WARN, CLR_BG, 1);
-    }
-    if (d->error_count != last_data.error_count)
-    {
-        y = START_Y + 14 * ROW_H;
-        LCD_Fill(COL2_X, y, SCR_W - 1, y + ROW_H - 1, CLR_BG);
-        GUI_DrawNum(COL2_X, y + 3, d->error_count,
-                    (d->error_count > 0) ? CLR_ERROR : CLR_VALUE, CLR_BG, 1);
+        if (d->free_heap != last_data.free_heap)
+        {
+            y = START_Y + 1 * ROW_H;
+            LCD_Fill(COL2_X, y, SCR_W - 1, y + ROW_H - 1, CLR_BG);
+            GUI_DrawNum(COL2_X, y + 3, (uint32_t)d->free_heap, CLR_VALUE, CLR_BG, 1);
+        }
+        if (d->min_heap != last_data.min_heap)
+        {
+            y = START_Y + 2 * ROW_H;
+            LCD_Fill(COL2_X, y, SCR_W - 1, y + ROW_H - 1, CLR_BG);
+            GUI_DrawNum(COL2_X, y + 3, (uint32_t)d->min_heap, CLR_WARN, CLR_BG, 1);
+        }
+        /* 历史栈最小值 */
+        if (d->min_monitor_stack != last_data.min_monitor_stack)
+        {
+            y = START_Y + 4 * ROW_H;
+            LCD_Fill(COL2_X, y, SCR_W - 1, y + ROW_H - 1, CLR_BG);
+            GUI_DrawNum(COL2_X, y + 3, d->min_monitor_stack, CLR_PEAK, CLR_BG, 1);
+        }
+        if (d->min_led_stack != last_data.min_led_stack)
+        {
+            y = START_Y + 5 * ROW_H;
+            LCD_Fill(COL2_X, y, SCR_W - 1, y + ROW_H - 1, CLR_BG);
+            GUI_DrawNum(COL2_X, y + 3, d->min_led_stack, CLR_PEAK, CLR_BG, 1);
+        }
+        if (d->min_input_stack != last_data.min_input_stack)
+        {
+            y = START_Y + 6 * ROW_H;
+            LCD_Fill(COL2_X, y, SCR_W - 1, y + ROW_H - 1, CLR_BG);
+            GUI_DrawNum(COL2_X, y + 3, d->min_input_stack, CLR_PEAK, CLR_BG, 1);
+        }
+        if (d->min_file_stack != last_data.min_file_stack)
+        {
+            y = START_Y + 7 * ROW_H;
+            LCD_Fill(COL2_X, y, SCR_W - 1, y + ROW_H - 1, CLR_BG);
+            GUI_DrawNum(COL2_X, y + 3, d->min_file_stack, CLR_PEAK, CLR_BG, 1);
+        }
+        if (d->min_music_stack != last_data.min_music_stack)
+        {
+            y = START_Y + 8 * ROW_H;
+            LCD_Fill(COL2_X, y, SCR_W - 1, y + ROW_H - 1, CLR_BG);
+            GUI_DrawNum(COL2_X, y + 3, d->min_music_stack, CLR_PEAK, CLR_BG, 1);
+        }
+        /* 队列峰值 */
+        if (d->peak_file_req_qwm != last_data.peak_file_req_qwm)
+        {
+            y = START_Y + 10 * ROW_H;
+            LCD_Fill(COL2_X, y, SCR_W - 1, y + ROW_H - 1, CLR_BG);
+            GUI_DrawNum(COL2_X, y + 3, d->peak_file_req_qwm, CLR_PEAK, CLR_BG, 1);
+        }
+        if (d->peak_file_resp_qwm != last_data.peak_file_resp_qwm)
+        {
+            y = START_Y + 11 * ROW_H;
+            LCD_Fill(COL2_X, y, SCR_W - 1, y + ROW_H - 1, CLR_BG);
+            GUI_DrawNum(COL2_X, y + 3, d->peak_file_resp_qwm, CLR_PEAK, CLR_BG, 1);
+        }
+        if (d->peak_music_cmd_qwm != last_data.peak_music_cmd_qwm)
+        {
+            y = START_Y + 12 * ROW_H;
+            LCD_Fill(COL2_X, y, SCR_W - 1, y + ROW_H - 1, CLR_BG);
+            GUI_DrawNum(COL2_X, y + 3, d->peak_music_cmd_qwm, CLR_PEAK, CLR_BG, 1);
+        }
+        if (d->error_count != last_data.error_count)
+        {
+            y = START_Y + 13 * ROW_H;
+            LCD_Fill(COL2_X, y, SCR_W - 1, y + ROW_H - 1, CLR_BG);
+            GUI_DrawNum(COL2_X, y + 3, d->error_count,
+                        (d->error_count > 0) ? CLR_ERROR : CLR_VALUE, CLR_BG, 1);
+        }
+        if (memcmp(d->task_states, last_data.task_states, 6) != 0)
+        {
+            y = START_Y + 14 * ROW_H;
+            LCD_Fill(COL2_X, y, SCR_W - 1, y + ROW_H - 1, CLR_BG);
+            GUI_DrawString(COL2_X, y + 3, d->task_states, CLR_VALUE, CLR_BG, 1);
+        }
     }
 }
 
@@ -280,6 +396,7 @@ void app_sysmonitor_run(key_state_t *key)
     monitor_data_t data;
     uint32_t now;
     uint8_t e_back = (!prev_key.back) && key->back;
+    uint8_t e_ok   = (!prev_key.ok)   && key->ok;
 
     /* BACK: 返回桌面 */
     if (e_back)
@@ -289,10 +406,19 @@ void app_sysmonitor_run(key_state_t *key)
         return;
     }
 
+    /* OK: 切换实时数据/历史峰值页 */
+    if (e_ok)
+    {
+        cur_page = !cur_page;
+        need_redraw = 1;
+        prev_key = *key;
+        return;
+    }
+
     Monitor_GetData(&data);
     now = data.tick;
 
-    /* 首次进入或从暂停恢复：全屏重绘 */
+    /* 首次进入/切页/从暂停恢复：全屏重绘 */
     if (need_redraw)
     {
         redraw_all(&data);

@@ -2,6 +2,7 @@
 #include "desktop.h"
 #include "app_registry.h"
 #include "monitor.h"
+#include "app_draw.h"
 #include <stddef.h>
 
 /* ---- 模块状态 ---- */
@@ -86,6 +87,14 @@ void AppManager_Run(key_state_t *key)
 {
     if (rt_state == RT_DESKTOP)
     {
+        /* 检查是否有从 FILE 应用触发的绘图打开请求 */
+        if (app_draw_is_open_requested())
+        {
+            /* DRAW 在注册表中的索引为 1 */
+            AppManager_StartApp(1);
+            return;
+        }
+
         /* 桌面运行：处理光标移动、图标选中 */
         int sel = Desktop_Run(key);
         if (sel >= 0)

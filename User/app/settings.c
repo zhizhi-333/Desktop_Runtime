@@ -1,9 +1,11 @@
 #include "settings.h"
 #include "stm32f4xx_hal.h"
 #include "main.h"
+#include "usart.h"
 #include "FreeRTOS.h"
 #include "task.h"
 #include "semphr.h"
+#include <stddef.h>
 
 /* ============================================================
  * 设置模块实现
@@ -36,6 +38,36 @@ static uint32_t clamp(uint32_t v, uint32_t lo, uint32_t hi)
     return v;
 }
 
+/* ---- CRC32 (多项式 0xEDB88320, 与 zlib/zip 一致) ----
+ * 用于校验 Flash 中设置数据的完整性, 防止掉电写入不完整导致数据损坏 */
+#define SETTINGS_CRC_POLY  0xEDB88320u
+static uint32_t settings_crc32(const uint32_t *data, int words)
+{
+    uint32_t crc = 0xFFFFFFFFu;
+    const uint8_t *p = (const uint8_t *)data;
+    int i;
+    for (i = 0; i < words * 4; i++)
+    {
+        crc ^= p[i];
+        int b;
+        for (b = 0; b < 8; b++)
+        {
+            if (crc & 1u)
+                crc = (crc >> 1) ^ SETTINGS_CRC_POLY;
+            else
+                crc = (crc >> 1);
+        }
+    }
+    return ~crc;
+}
+
+/* 计算设置数据的 CRC（覆盖 magic..screen_timeout, 不含 crc 字段） */
+static uint32_t settings_compute_crc(const settings_data_t *s)
+{
+    return settings_crc32((const uint32_t *)s,
+                          (int)(offsetof(settings_data_t, crc) / 4));
+}
+
 /* ---- 从 Flash 读取设置 ---- */
 static int load_from_flash(void)
 {
@@ -47,6 +79,14 @@ static int load_from_flash(void)
 
     /* 复制到内存 */
     g_settings = *flash;
+
+    /* CRC 校验：防止掉电/写入不完整导致数据损坏
+     * 旧版数据(无 CRC 字段)或损坏数据都会校验失败 -> 返回 -1 由上层恢复默认 */
+    if (g_settings.crc != settings_compute_crc(&g_settings))
+    {
+        Log_Printf("[SET] CRC mismatch! flash data corrupted, using defaults\r\n");
+        return -1;
+    }
 
     /* 校验范围（防止 Flash 数据损坏） */
     g_settings.cursor_sensitivity = clamp(g_settings.cursor_sensitivity, SENSITIVITY_MIN, SENSITIVITY_MAX);
@@ -66,6 +106,9 @@ static int save_to_flash(void)
     uint32_t err;
     uint32_t *src;
     int i;
+
+    /* 0. 计算并填入 CRC（覆盖 magic..screen_timeout, 不含 crc 字段） */
+    g_settings.crc = settings_compute_crc(&g_settings);
 
     /* 1. 解锁 Flash */
     status = HAL_FLASH_Unlock();

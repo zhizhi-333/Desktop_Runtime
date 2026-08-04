@@ -55,4 +55,8 @@ int MusicTask_GetCmdWatermark(void);
 /* 查询任务栈剩余(字,供 SYSMONITOR 显示) */
 uint32_t MusicTask_GetStackWatermark(void);
 
+/* 查询任务运行状态(供 SYSMONITOR 显示)
+ * 返回 eTaskState: eRunning/eReady/eBlocked/eSuspended/eDeleted */
+eTaskState MusicTask_GetState(void);
+
 #endif /* MUSIC_TASK_H */

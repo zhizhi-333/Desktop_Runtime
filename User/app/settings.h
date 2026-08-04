@@ -29,14 +29,16 @@
 #define TIMEOUT_MIN       5
 #define TIMEOUT_MAX       60
 
-/* 设置数据结构（存入 Flash，4 字节对齐） */
+/* 设置数据结构（存入 Flash，4 字节对齐）
+ * CRC 字段对前面的所有字段做 CRC32 校验，防止掉电导致数据损坏 */
 typedef struct {
     uint32_t magic;                 /* 魔数，校验数据有效性 */
     uint32_t cursor_sensitivity;    /* 光标灵敏度（1-20） */
     uint32_t cursor_size;           /* 光标大小（3-15） */
     uint32_t brightness;            /* 屏幕亮度（0-100%） */
-    uint32_t volume;                /* 系统音量（0-100%） */
+    uint32_t volume;                /* 系统音量（0-100） */
     uint32_t screen_timeout;        /* 熄屏时间（5-60秒） */
+    uint32_t crc;                   /* CRC32(覆盖 magic..screen_timeout, 不含本字段) */
 } settings_data_t;
 
 /* 初始化设置（从 Flash 读取，无效则用默认值） */

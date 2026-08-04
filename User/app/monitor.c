@@ -37,6 +37,16 @@ static sys_runtime_state_t cur_state = SYS_STATE_BOOT;
 /* ---- 系统错误标志（位图） ---- */
 static uint32_t sys_err_flags = SYS_ERR_NONE;
 
+/* ---- 看门狗 (IWDG) ---- */
+static IWDG_HandleTypeDef hiwdg;
+
+/* ---- 任务心跳计数器(volatile: 中断/多任务读取) ---- */
+volatile uint32_t task_heartbeats[HB_TASK_COUNT] = {0};
+
+/* ---- 运行负载分析历史峰值(由 MonitorTask 更新, Monitor_GetData 读取) ---- */
+uint32_t load_min_stacks[5];    /* 各任务栈历史最小值(最大使用) */
+uint32_t load_peak_queues[3];   /* 队列历史峰值: [0]=FileReq [1]=FileResp [2]=MusicCmd */
+
 /* 系统状态（InputTask 顶层状态机） */
 typedef enum {
     SYS_LOGIN,      /* 首次登录界面 */
@@ -86,6 +96,20 @@ static void backlight_on(void)
     Log_Printf("[SCREEN] backlight on\r\n");
 }
 
+/* ---- eTaskState 转字符（R=Running r=Ready B=Blocked S=Suspended D=Deleted） ---- */
+static char task_state_char(eTaskState s)
+{
+    switch (s)
+    {
+        case eRunning:   return 'R';
+        case eReady:     return 'r';
+        case eBlocked:   return 'B';
+        case eSuspended: return 'S';
+        case eDeleted:   return 'D';
+        default:         return '?';
+    }
+}
+
 /* ---- 监控数据接口实现 ---- */
 void Monitor_GetData(monitor_data_t *data)
 {
@@ -105,6 +129,50 @@ void Monitor_GetData(monitor_data_t *data)
     data->file_req_qwm  = (uint32_t)FileTask_GetReqWatermark();
     data->file_resp_qwm = (uint32_t)FileTask_GetRespWatermark();
     data->music_cmd_qwm = (uint32_t)MusicTask_GetCmdWatermark();
+    data->task_states[0] = task_state_char(eTaskGetState(monitor_task_handle));
+    data->task_states[1] = task_state_char(eTaskGetState(led_task_handle));
+    data->task_states[2] = task_state_char(eTaskGetState(input_task_handle));
+    data->task_states[3] = task_state_char(FileTask_GetState());
+    data->task_states[4] = task_state_char(MusicTask_GetState());
+    data->task_states[5] = 0;
+
+    /* ---- 历史峰值(运行负载分析) ---- */
+    data->min_monitor_stack = load_min_stacks[0];
+    data->min_led_stack     = load_min_stacks[1];
+    data->min_input_stack   = load_min_stacks[2];
+    data->min_file_stack    = load_min_stacks[3];
+    data->min_music_stack   = load_min_stacks[4];
+    data->peak_file_req_qwm  = load_peak_queues[0];
+    data->peak_file_resp_qwm = load_peak_queues[1];
+    data->peak_music_cmd_qwm = load_peak_queues[2];
+}
+
+/* ============================================================
+ * 看门狗 (IWDG) + 任务心跳
+ * ============================================================ */
+
+/* 初始化 IWDG 硬件看门狗
+ * LSI ≈ 32kHz, Prescaler=256 -> 125Hz, Reload=1562 -> ~12.5s 超时
+ * (留足够时间让 MonitorTask 每秒喂狗,并容忍短暂阻塞) */
+void Monitor_WDG_Init(void)
+{
+    hiwdg.Instance       = IWDG;
+    hiwdg.Init.Prescaler = IWDG_PRESCALER_256;
+    hiwdg.Init.Reload    = 1562;
+    /* 本 HAL 版本无 Window 字段, 不设置即默认禁用窗口模式 */
+    if (HAL_IWDG_Init(&hiwdg) != HAL_OK)
+    {
+        Log_Printf("[WDT] !!! IWDG init FAILED !!!\r\n");
+        return;
+    }
+    Log_Printf("[WDT] IWDG initialized (timeout ~12.5s)\r\n");
+}
+
+/* 任务心跳上报 */
+void Monitor_Heartbeat(hb_task_id_t id)
+{
+    if (id < HB_TASK_COUNT)
+        task_heartbeats[id]++;
 }
 
 void Monitor_IncInputEvent(void)    { evt_input++; }
@@ -142,6 +210,7 @@ const char *Monitor_GetErrorString(void)
     if (sys_err_flags & SYS_ERR_SD)    { if(pos) buf[pos++]=','; buf[pos++]='S'; buf[pos++]='D'; }
     if (sys_err_flags & SYS_ERR_STACK) { if(pos) buf[pos++]=','; buf[pos++]='S'; buf[pos++]='T'; buf[pos++]='K'; }
     if (sys_err_flags & SYS_ERR_HEAP)  { if(pos) buf[pos++]=','; buf[pos++]='H'; buf[pos++]='P'; }
+    if (sys_err_flags & SYS_ERR_TASK_HANG) { if(pos) buf[pos++]=','; buf[pos++]='H'; buf[pos++]='A'; buf[pos++]='N'; buf[pos++]='G'; }
     buf[pos] = 0;
     return buf;
 }
@@ -416,6 +485,7 @@ static void InputTask(void *arg)
         }
 
         prev_key = key;
+        Monitor_Heartbeat(HB_INPUT);
         vTaskDelay(pdMS_TO_TICKS(20));
     }
 }
@@ -428,6 +498,7 @@ static void LedTask(void *arg)
     for (;;)
     {
         HAL_GPIO_TogglePin(LED0_GPIO_Port, LED0_Pin);
+        Monitor_Heartbeat(HB_LED);
         vTaskDelay(pdMS_TO_TICKS(500));
     }
 }
@@ -437,6 +508,23 @@ static void MonitorTask(void *arg)
 {
     (void)arg;
     TickType_t last = xTaskGetTickCount();
+    uint32_t prev_hb[HB_TASK_COUNT];      /* 上一轮心跳值(检测是否增长) */
+    uint32_t hang_seconds[HB_TASK_COUNT]; /* 各任务连续未心跳的秒数 */
+    int i;
+
+    /* 历史峰值(运行负载分析) - 记录最大栈使用=最小剩余 */
+    static uint32_t hist_min_mon_stack = (uint32_t)-1;
+    static uint32_t hist_min_led_stack = (uint32_t)-1;
+    static uint32_t hist_min_inp_stack = (uint32_t)-1;
+    static uint32_t hist_min_fil_stack = (uint32_t)-1;
+    static uint32_t hist_min_mus_stack = (uint32_t)-1;
+    static uint32_t hist_peak_file_req = 0;
+    static uint32_t hist_peak_file_resp = 0;
+    static uint32_t hist_peak_music_cmd = 0;
+
+    /* 将历史峰值导出给 Monitor_GetData */
+    #define UPDATE_MIN(dst, val) do { if ((val) < (dst)) (dst) = (val); } while(0)
+    #define UPDATE_MAX(dst, val) do { if ((val) > (dst)) (dst) = (val); } while(0)
 
     Log_Printf("[MON] task entered, tick=%u\r\n", (unsigned)xTaskGetTickCount());
     Log_Printf("\r\n========== FreeRTOS Started ==========\r\n");
@@ -445,10 +533,84 @@ static void MonitorTask(void *arg)
                (unsigned)configTOTAL_HEAP_SIZE, configMAX_PRIORITIES);
     Log_Printf("======================================\r\n\r\n");
 
+    /* 心跳检测初始化 */
+    for (i = 0; i < HB_TASK_COUNT; i++)
+    {
+        prev_hb[i] = task_heartbeats[i];
+        hang_seconds[i] = 0;
+    }
+
     for (;;)
     {
         size_t free_heap = xPortGetFreeHeapSize();
         if (free_heap < min_ever_heap) min_ever_heap = free_heap;
+
+        /* ---- 任务心跳检测 ---- */
+        int all_alive = 1;
+        for (i = 0; i < HB_TASK_COUNT; i++)
+        {
+            if (task_heartbeats[i] != prev_hb[i])
+            {
+                prev_hb[i] = task_heartbeats[i];
+                hang_seconds[i] = 0;
+            }
+            else
+            {
+                hang_seconds[i]++;
+                /* 超过 5 秒(5 次循环)无心跳 -> 卡死 */
+                if (hang_seconds[i] >= 5)
+                {
+                    all_alive = 0;
+                    if (!(sys_err_flags & SYS_ERR_TASK_HANG))
+                    {
+                        Monitor_SetError(SYS_ERR_TASK_HANG);
+                        Log_Printf("[WDT] !!! task %d hang detected, stopping watchdog feed !!!\r\n", i);
+                    }
+                }
+            }
+        }
+
+        /* ---- 喂狗: 仅当所有任务健康时 ---- */
+        if (all_alive)
+        {
+            HAL_IWDG_Refresh(&hiwdg);
+            /* 卡死恢复后清除标志 */
+            if (sys_err_flags & SYS_ERR_TASK_HANG)
+            {
+                Monitor_ClearError(SYS_ERR_TASK_HANG);
+                Log_Printf("[WDT] tasks recovered, watchdog feed resumed\r\n");
+            }
+        }
+        /* else: 不喂狗, IWDG 超时后复位整个系统 */
+
+        /* ---- 更新历史峰值(运行负载分析) ---- */
+        {
+            uint32_t ms = (uint32_t)uxTaskGetStackHighWaterMark(monitor_task_handle);
+            uint32_t ls = (uint32_t)uxTaskGetStackHighWaterMark(led_task_handle);
+            uint32_t is = (uint32_t)uxTaskGetStackHighWaterMark(input_task_handle);
+            uint32_t fs = FileTask_GetStackWatermark();
+            uint32_t us = MusicTask_GetStackWatermark();
+            uint32_t fr = (uint32_t)FileTask_GetReqWatermark();
+            uint32_t fp = (uint32_t)FileTask_GetRespWatermark();
+            uint32_t mc = (uint32_t)MusicTask_GetCmdWatermark();
+            UPDATE_MIN(hist_min_mon_stack, ms);
+            UPDATE_MIN(hist_min_led_stack, ls);
+            UPDATE_MIN(hist_min_inp_stack, is);
+            UPDATE_MIN(hist_min_fil_stack, fs);
+            UPDATE_MIN(hist_min_mus_stack, us);
+            UPDATE_MAX(hist_peak_file_req, fr);
+            UPDATE_MAX(hist_peak_file_resp, fp);
+            UPDATE_MAX(hist_peak_music_cmd, mc);
+            /* 保存到全局供 Monitor_GetData 读取 */
+            load_min_stacks[0] = hist_min_mon_stack;
+            load_min_stacks[1] = hist_min_led_stack;
+            load_min_stacks[2] = hist_min_inp_stack;
+            load_min_stacks[3] = hist_min_fil_stack;
+            load_min_stacks[4] = hist_min_mus_stack;
+            load_peak_queues[0] = hist_peak_file_req;
+            load_peak_queues[1] = hist_peak_file_resp;
+            load_peak_queues[2] = hist_peak_music_cmd;
+        }
 
         Log_Printf("[MON] tick=%u  free_heap=%u  min_heap=%u  monitor_stack=%u  led_stack=%u\r\n",
                    (unsigned)xTaskGetTickCount(),
@@ -456,6 +618,8 @@ static void MonitorTask(void *arg)
                    (unsigned)min_ever_heap,
                    (unsigned)uxTaskGetStackHighWaterMark(monitor_task_handle),
                    (unsigned)uxTaskGetStackHighWaterMark(led_task_handle));
+
+        Monitor_Heartbeat(HB_MONITOR);  /* 自身心跳 */
 
         vTaskDelayUntil(&last, pdMS_TO_TICKS(1000));
     }

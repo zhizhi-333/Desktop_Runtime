@@ -6,6 +6,7 @@
 #include "settings.h"
 #include "file_sys.h"
 #include "file_task.h"
+#include "app_draw.h"
 #include "log_store.h"
 #include <string.h>
 #include <stdio.h>
@@ -225,7 +226,7 @@ static void draw_list(void)
     }
 
     /* 列表标题行 */
-    GUI_DrawString(10, LIST_Y0 - 18, "Name         Size", CLR_HINT, CLR_BG, 1);
+    GUI_DrawString(10, LIST_Y0 - 18, "Name         Size T St Blk", CLR_HINT, CLR_BG, 1);
 
     /* 文件列表 */
     if (count == 0)
@@ -240,14 +241,22 @@ static void draw_list(void)
             const file_entry_t *e = FileSys_GetEntry(i + list_scroll);
             int y = LIST_Y0 + i * LIST_ROW_H;
             char pretty[13];
-            char line[32];
+            char line[40];
+            char type_c;
+            const char *state_s;
 
             if (e == NULL) break;
 
             FileSys_PrettyName(e->name, pretty);
-            snprintf(line, sizeof(line), "%s%-12s %lu B",
+            type_c  = (e->type == FS_TYPE_TEXT) ? 'T' :
+                      (e->type == FS_TYPE_DRAW) ? 'D' : 'C';
+            state_s = (e->state == FS_STATE_NORMAL)   ? "OK" :
+                      (e->state == FS_STATE_READONLY) ? "RO" : "HD";
+
+            snprintf(line, sizeof(line), "%s%-12s %3luB %c %s B%d",
                      (i + list_scroll == sel_idx) ? ">" : " ",
-                     pretty, (unsigned long)e->size);
+                     pretty, (unsigned long)e->size,
+                     type_c, state_s, e->block_addr);
 
             GUI_DrawString(10, y, line,
                            (i + list_scroll == sel_idx) ? CLR_SEL : CLR_TEXT,
@@ -293,29 +302,43 @@ static void run_list(key_state_t *key)
         draw_list();
     }
 
-    /* OK: 打开文件 (异步: 先投递 READ 请求) */
+    /* OK: 打开文件 */
     if (e_ok && count > 0)
     {
-        file_req_t req;
-        memset(&req, 0, sizeof(req));
-        req.op  = FILE_OP_READ;
-        req.idx = sel_idx;
-        req.buf = content_buf;
-        req.len = FS_FILE_MAX_SIZE;
+        const file_entry_t *e = FileSys_GetEntry(sel_idx);
 
-        if (FileTask_Request(&req, 0))
+        /* 绘图文件: 触发 DRAW 应用打开 */
+        if (e && e->type == FS_TYPE_DRAW)
         {
-            view_scroll = 0;
-            pending_op = FILE_OP_READ;
-            wait_return = FS_VIEW;
-            wait_param = sel_idx;
-            fs_state = FS_WAIT;
-            need_redraw = 1;
+            app_draw_request_open();
+            AppManager_GotoDesktop();
+            prev_key = *key;
+            return;
         }
-        else
+
+        /* 文本文件: 异步投递 READ 请求 */
         {
-            show_msg("BUSY!");
-            draw_list();
+            file_req_t req;
+            memset(&req, 0, sizeof(req));
+            req.op  = FILE_OP_READ;
+            req.idx = sel_idx;
+            req.buf = content_buf;
+            req.len = FS_FILE_MAX_SIZE;
+
+            if (FileTask_Request(&req, 0))
+            {
+                view_scroll = 0;
+                pending_op = FILE_OP_READ;
+                wait_return = FS_VIEW;
+                wait_param = sel_idx;
+                fs_state = FS_WAIT;
+                need_redraw = 1;
+            }
+            else
+            {
+                show_msg("BUSY!");
+                draw_list();
+            }
         }
     }
 

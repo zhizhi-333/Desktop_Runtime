@@ -1,5 +1,6 @@
 #include "music_task.h"
 #include "usart.h"
+#include "monitor.h"
 #include <string.h>
 
 /* ============================================================
@@ -70,6 +71,8 @@ static void MusicTask(void *arg)
         /* 推进播放 */
         Music_Update();
 
+        Monitor_Heartbeat(HB_MUSIC);
+
         /* 固定周期 20ms */
         vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(MUSIC_TICK_MS));
     }
@@ -108,4 +111,11 @@ uint32_t MusicTask_GetStackWatermark(void)
 {
     if (music_task_handle == NULL) return 0;
     return (uint32_t)uxTaskGetStackHighWaterMark(music_task_handle);
+}
+
+/* ---- 任务运行状态 ---- */
+eTaskState MusicTask_GetState(void)
+{
+    if (music_task_handle == NULL) return eDeleted;
+    return eTaskGetState(music_task_handle);
 }
