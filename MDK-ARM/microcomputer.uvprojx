@@ -340,7 +340,7 @@
               <MiscControls></MiscControls>
               <Define>USE_HAL_DRIVER,STM32F407xx</Define>
               <Undefine></Undefine>
-              <IncludePath>../Core/Inc;../Drivers/STM32F4xx_HAL_Driver/Inc;../Drivers/STM32F4xx_HAL_Driver/Inc/Legacy;../Drivers/CMSIS/Device/ST/STM32F4xx/Include;../Drivers/CMSIS/Include;../FreeRTOS/include;../FreeRTOS/portable/ARM_CM4F;../user/dev;../user/app</IncludePath>
+              <IncludePath>../Core/Inc;../Drivers/STM32F4xx_HAL_Driver/Inc;../Drivers/STM32F4xx_HAL_Driver/Inc/Legacy;../Drivers/CMSIS/Device/ST/STM32F4xx/Include;../Drivers/CMSIS/Include;../FreeRTOS/include;../FreeRTOS/portable/ARM_CM4F;../User/dev;../User/app</IncludePath>
             </VariousControls>
           </Cads>
           <Aads>
@@ -544,22 +544,22 @@
             <File>
               <FileName>lcd.c</FileName>
               <FileType>1</FileType>
-              <FilePath>../user/dev/lcd.c</FilePath>
+              <FilePath>../User/dev/lcd.c</FilePath>
             </File>
             <File>
               <FileName>encoder.c</FileName>
               <FileType>1</FileType>
-              <FilePath>../user/dev/encoder.c</FilePath>
+              <FilePath>../User/dev/encoder.c</FilePath>
             </File>
             <File>
               <FileName>key.c</FileName>
               <FileType>1</FileType>
-              <FilePath>../user/dev/key.c</FilePath>
+              <FilePath>../User/dev/key.c</FilePath>
             </File>
             <File>
               <FileName>sd_test.c</FileName>
               <FileType>1</FileType>
-              <FilePath>../user/dev/sd_test.c</FilePath>
+              <FilePath>../User/dev/sd_test.c</FilePath>
             </File>
             <File>
               <FileName>dac.c</FileName>
@@ -579,52 +579,52 @@
             <File>
               <FileName>input_test.c</FileName>
               <FileType>1</FileType>
-              <FilePath>../user/app/input_test.c</FilePath>
+              <FilePath>../User/app/input_test.c</FilePath>
             </File>
             <File>
               <FileName>monitor.c</FileName>
               <FileType>1</FileType>
-              <FilePath>../user/app/monitor.c</FilePath>
+              <FilePath>../User/app/monitor.c</FilePath>
             </File>
             <File>
               <FileName>gui.c</FileName>
               <FileType>1</FileType>
-              <FilePath>../user/app/gui.c</FilePath>
+              <FilePath>../User/app/gui.c</FilePath>
             </File>
             <File>
               <FileName>login.c</FileName>
               <FileType>1</FileType>
-              <FilePath>../user/app/login.c</FilePath>
+              <FilePath>../User/app/login.c</FilePath>
             </File>
             <File>
               <FileName>app_manager.c</FileName>
               <FileType>1</FileType>
-              <FilePath>../user/app/app_manager.c</FilePath>
+              <FilePath>../User/app/app_manager.c</FilePath>
             </File>
             <File>
               <FileName>app_registry.c</FileName>
               <FileType>1</FileType>
-              <FilePath>../user/app/app_registry.c</FilePath>
+              <FilePath>../User/app/app_registry.c</FilePath>
             </File>
             <File>
               <FileName>desktop.c</FileName>
               <FileType>1</FileType>
-              <FilePath>../user/app/desktop.c</FilePath>
+              <FilePath>../User/app/desktop.c</FilePath>
             </File>
             <File>
               <FileName>app_sysmonitor.c</FileName>
               <FileType>1</FileType>
-              <FilePath>../user/app/app_sysmonitor.c</FilePath>
+              <FilePath>../User/app/app_sysmonitor.c</FilePath>
             </File>
             <File>
               <FileName>settings.c</FileName>
               <FileType>1</FileType>
-              <FilePath>../user/app/settings.c</FilePath>
+              <FilePath>../User/app/settings.c</FilePath>
             </File>
             <File>
               <FileName>app_settings.c</FileName>
               <FileType>1</FileType>
-              <FilePath>../user/app/app_settings.c</FilePath>
+              <FilePath>../User/app/app_settings.c</FilePath>
             </File>
             <File>
               <FileName>log_store.c</FileName>
