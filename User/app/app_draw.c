@@ -7,6 +7,8 @@
 #include "encoder.h"
 #include "file_sys.h"
 #include "usart.h"
+#include "FreeRTOS.h"
+#include "task.h"
 #include <stddef.h>
 #include <string.h>
 
@@ -25,9 +27,10 @@
  *
  * 操作:
  *   方向键    移动画笔（步长从设置读取）
- *   OK        切换落笔/抬笔
+ *   OK 短按  切换落笔/抬笔
+ *   OK 长按  清空画布（按住≥1秒）
  *   编码器旋  切换画笔颜色（7 色循环）
- *   编码器按  清空画布
+ *   编码器按  最小化应用（回桌面，绘图保留）
  *   BACK      返回桌面
  *
  * 说明:
@@ -75,6 +78,8 @@ static int color_idx;               /* 当前颜色索引 */
 static int16_t pen_x, pen_y;        /* 画笔当前位置 */
 static int16_t prev_pen_x, prev_pen_y;  /* 上次位置（画线起点） */
 static key_state_t prev_key;
+static uint32_t ok_press_tick;      /* OK 按下时刻(用于长按检测) */
+static int ok_long_triggered;       /* 本次 OK 长按是否已触发(防止重复) */
 
 /* ---- 画图操作记录（用于持久化） ---- */
 static draw_op_t draw_ops[DRAW_MAX_OPS];  /* 操作数组 (约 20KB) */
@@ -90,6 +95,7 @@ typedef enum {
 static draw_substate_t draw_state;
 static int confirm_sel;       /* 确认框选择: 0=NO 1=YES */
 static int need_save;         /* 退出时是否需要保存 */
+static int draw_dirty;        /* 本次会话是否有新操作(用于决定是否弹保存框) */
 
 /* ---- 保存画图操作到 SD 卡 ---- */
 static void draw_save(void)
@@ -244,7 +250,7 @@ static void draw_status(void)
     GUI_DrawNum(190, 8, pen_y, WHITE, BLACK, 1);
 
     /* 清空提示 */
-    GUI_DrawString(SCR_W - 55, 8, "EC=CLR", GRAY, BLACK, 1);
+    GUI_DrawString(SCR_W - 60, 8, "OK~=CLR", GRAY, BLACK, 1);
 }
 
 /* ---- 全屏重绘 ---- */
@@ -284,6 +290,7 @@ void app_draw_start(void)
     }
     draw_state = DRAW_NORMAL;
     need_save  = 0;
+    draw_dirty = 0;   /* 本次会话尚无新操作 */
     need_redraw = 1;
 }
 
@@ -295,7 +302,6 @@ void app_draw_run(key_state_t *key)
     uint8_t e_right = (!prev_key.right) && key->right;
     uint8_t e_ok    = (!prev_key.ok)    && key->ok;
     uint8_t e_back  = (!prev_key.back)  && key->back;
-    uint8_t e_ecsw  = (!prev_key.ec_sw) && key->ec_sw;
     int16_t enc_delta = Encoder_GetDelta();
     int16_t moved = 0;
 
@@ -329,9 +335,17 @@ void app_draw_run(key_state_t *key)
 
     /* ---- 正常画图状态 ---- */
 
-    /* BACK: 弹出保存确认框 */
+    /* BACK: 有操作则弹保存确认框，无操作直接退出 */
     if (e_back)
     {
+        if (!draw_dirty)
+        {
+            /* 本次会话无任何画图操作，直接退出不保存 */
+            need_save = 0;
+            AppManager_GotoDesktop();
+            prev_key = *key;
+            return;
+        }
         draw_state = DRAW_CONFIRM;
         confirm_sel = 1;  /* 默认选 YES */
         draw_confirm();
@@ -341,7 +355,7 @@ void app_draw_run(key_state_t *key)
     int status_changed = 0;
 
     /* 输入事件计数 */
-    if (e_up || e_down || e_left || e_right || e_ok || e_ecsw)
+    if (e_up || e_down || e_left || e_right || e_ok)
         Monitor_IncInputEvent();
 
     /* 首次进入全屏重绘 */
@@ -385,17 +399,41 @@ void app_draw_run(key_state_t *key)
                 draw_ops[draw_op_count].y2 = pen_y;
                 draw_ops[draw_op_count].color = palette[color_idx];
                 draw_op_count++;
+                draw_dirty = 1;   /* 有新画图操作 */
             }
         }
 
         status_changed = 1;  /* 坐标变了，更新状态栏 */
     }
 
-    /* ---- OK 键：切换落笔/抬笔 ---- */
-    if (e_ok)
+    /* ---- OK 键：短按=切换落笔/抬笔，长按(≥1秒)=清空画布 ---- */
+    if (key->ok && !prev_key.ok)
     {
-        pen_down = !pen_down;
-        status_changed = 1;
+        /* OK 刚按下：记录时刻 */
+        ok_press_tick = xTaskGetTickCount();
+        ok_long_triggered = 0;
+    }
+    if (key->ok && !ok_long_triggered)
+    {
+        /* 持续按住超过 1 秒：触发清空 */
+        if ((xTaskGetTickCount() - ok_press_tick) >= pdMS_TO_TICKS(1000))
+        {
+            LCD_Fill(0, CANVAS_Y0, SCR_W - 1, SCR_H - 1, BLACK);
+            draw_op_count = 0;
+            draw_dirty = 1;
+            ok_long_triggered = 1;
+            status_changed = 1;
+            Monitor_IncInputEvent();
+        }
+    }
+    if (!key->ok && prev_key.ok)
+    {
+        /* OK 松开：若长按未触发，则为短按=切换落笔/抬笔 */
+        if (!ok_long_triggered)
+        {
+            pen_down = !pen_down;
+            status_changed = 1;
+        }
     }
 
     /* ---- 编码器旋转：切换颜色 ---- */
@@ -408,14 +446,6 @@ void app_draw_run(key_state_t *key)
     {
         color_idx = (color_idx - 1 + PALETTE_COUNT) % PALETTE_COUNT;
         status_changed = 1;
-    }
-
-    /* ---- 编码器按压：清空画布 ---- */
-    if (e_ecsw)
-    {
-        LCD_Fill(0, CANVAS_Y0, SCR_W - 1, SCR_H - 1, BLACK);
-        draw_op_count = 0;  /* 清空操作记录 */
-        Monitor_IncInputEvent();
     }
 
     /* ---- 状态栏更新 ---- */

@@ -6,9 +6,17 @@
 /* ============================================================
  * 应用管理器
  *
- * 单前台模式：同一时刻只有一个应用在前台运行
+ * 单前台模式 + 任务栏最小化：
+ *   - 同一时刻只有一个应用在前台运行
+ *   - 编码器按压 = 最小化当前应用（挂起到任务栏，音乐继续播放）
+ *   - BACK = 退出当前应用（彻底关闭，回桌面）
+ *   - 桌面任务栏显示已最小化的应用，点击切换回来
+ *
  * 切换应用时：当前应用 on_pause → 新应用 on_start
  * ============================================================ */
+
+/* 最大最小化应用数（任务栏最多显示数） */
+#define MAX_MINIMIZED  4
 
 /* 应用状态 */
 typedef enum {
@@ -42,8 +50,26 @@ rt_state_t AppManager_GetState(void);
 /* 获取当前前台应用索引（-1 表示无） */
 int AppManager_GetCurrentApp(void);
 
-/* 进入桌面（从应用返回） */
+/* 进入桌面（从应用返回，彻底关闭当前应用）
+ * 等价于"关闭"：当前应用从最小化列表移除，状态置 NONE */
 void AppManager_GotoDesktop(void);
+
+/* 最小化当前应用（挂起到任务栏，调用 on_pause 保存状态）
+ * 音乐等独立任务应用最小化后继续后台运行
+ * 返回：0=成功, -1=无前台应用或任务栏已满 */
+int AppManager_MinimizeCurrent(void);
+
+/* 从任务栏恢复指定最小化应用到前台
+ * slot: 最小化列表中的位置(0~MAX_MINIMIZED-1)
+ * 返回：0=成功, -1=非法 slot */
+int AppManager_RestoreMinimized(int slot);
+
+/* 获取最小化应用数量 */
+int AppManager_GetMinimizedCount(void);
+
+/* 获取最小化列表中第 slot 个应用的注册表索引
+ * 返回：>=0 应用索引, -1=该 slot 为空 */
+int AppManager_GetMinimizedApp(int slot);
 
 /* 启动指定应用（从桌面进入）
  * idx: 应用在注册表中的索引

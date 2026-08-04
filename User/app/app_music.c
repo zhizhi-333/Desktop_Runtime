@@ -8,6 +8,8 @@
 #include "music_task.h"
 #include "dac.h"
 #include "encoder.h"
+#include "FreeRTOS.h"
+#include "task.h"
 #include <stddef.h>
 #include <stdio.h>
 #include <string.h>
@@ -20,7 +22,7 @@
  *   │ MUSIC PLAYER                     │  标题
  *   ├──────────────────────────────────┤
  *   │ > 1. Two Tigers                  │  曲目列表
- *   │   2. Little Star                 │  (↑↓ 选择)
+ *   │   2. Little Star                 │  (↑↓ 选择/切歌)
  *   │   3. Happy B-Day                 │
  *   │                                  │
  *   ├──────────────────────────────────┤
@@ -28,19 +30,21 @@
  *   │ Note: C4   [####------] 4/34     │  播放进度
  *   │ State: PLAYING                   │  状态
  *   ├──────────────────────────────────┤
- *   │ OK:Play/Pause  EC:Vol+  EC_SW:Stop│  操作提示
- *   │ BACK:Exit                        │
+ *   │ OK短:Play/Pause  OK长:Stop       │  操作提示
+ *   │ EC:Vol  EC_SW:Minimize  BACK:Exit│
  *   └──────────────────────────────────┘
  *
  * 操作:
- *   ↑↓      选择曲目
- *   OK      播放/暂停
+ *   ↑↓      非播放:选择曲目 / 播放中:直接切上一首下一首
+ *   OK短按  播放/暂停
+ *   OK长按  停止播放
  *   编码器旋 调节音量
- *   编码器按 停止播放
- *   BACK    退出
+ *   编码器按 最小化(音乐继续后台播放)
+ *   BACK    退出(停止播放)
  *
- * 退出处理:
- *   - on_pause 时停止播放,避免后台继续发声
+ * 最小化处理:
+ *   - on_pause 时不停止播放,音乐继续后台播放
+ *   - BACK 退出时才停止播放
  *   - 音量关联系统设置 (Settings_Volume)
  * ============================================================ */
 
@@ -71,6 +75,10 @@ static key_state_t prev_key;
 static int prev_enc_delta;
 static int last_note_idx;       /* 上次显示的音符索引(检测变化) */
 static music_state_t last_state;/* 上次显示的状态 */
+static uint32_t ok_press_tick;  /* OK 按下时刻(用于长按判定) */
+static int ok_was_pressed;      /* OK 当前是否处于按下状态 */
+
+#define OK_LONG_PRESS_MS  1000  /* OK 长按阈值(毫秒) */
 
 /* ---- 增量更新跟踪变量 ---- */
 static int prev_filled;              /* 上次进度条填充宽度 */
@@ -253,13 +261,25 @@ static void redraw_all(void)
 
     /* 底部提示 */
     LCD_Fill(0, FOOTER_Y, SCR_W - 1, SCR_H - 1, CLR_BG);
-    GUI_DrawString(5, FOOTER_Y,      "OK:Play/Pause  EC:Vol  EC_SW:Stop", CLR_HINT, CLR_BG, 1);
-    GUI_DrawString(5, FOOTER_Y + 14, "UP/DN:Select  BACK:Exit", CLR_HINT, CLR_BG, 1);
+    GUI_DrawString(5, FOOTER_Y,      "OK短:Play/Pause OK长:Stop EC:Vol", CLR_HINT, CLR_BG, 1);
+    GUI_DrawString(5, FOOTER_Y + 14, "EC_SW:Minimize  BACK:Exit", CLR_HINT, CLR_BG, 1);
 }
 
 /* ============================================================
  * 应用入口
  * ============================================================ */
+
+/* ---- 切换到指定曲目并播放 ---- */
+static void play_track(int idx)
+{
+    int count = Music_GetTrackCount();
+    if (idx < 0 || idx >= count) return;
+    sel_track = idx;
+    MusicTask_SendCmd(MUSIC_CMD_STOP, 0, 0);   /* 先停当前 */
+    MusicTask_SendCmd(MUSIC_CMD_LOAD, sel_track, 0);
+    MusicTask_SendCmd(MUSIC_CMD_PLAY, 0, 0);
+    draw_track_list();
+}
 
 void app_music_create(void)
 {
@@ -283,11 +303,13 @@ void app_music_run(key_state_t *key)
     uint8_t e_down  = (!prev_key.down)  && key->down;
     uint8_t e_ok    = (!prev_key.ok)    && key->ok;
     uint8_t e_back  = (!prev_key.back)  && key->back;
-    uint8_t e_ecsw  = (!prev_key.ec_sw) && key->ec_sw;
+    uint8_t ok_released = (prev_key.ok) && (!key->ok);   /* OK 释放边沿 */
     int16_t enc_delta = Encoder_GetDelta();
     int need_info_update = 0;
+    music_state_t st = Music_GetState();
+    int is_playing = (st == MUSIC_PLAYING || st == MUSIC_PAUSED);
 
-    /* BACK: 停止播放并返回桌面 */
+    /* BACK: 停止播放并返回桌面（彻底退出） */
     if (e_back)
     {
         MusicTask_SendCmd(MUSIC_CMD_STOP, 0, 0);
@@ -296,7 +318,7 @@ void app_music_run(key_state_t *key)
         return;
     }
 
-    if (e_up || e_down || e_ok || e_ecsw)
+    if (e_up || e_down || e_ok || ok_released)
         Monitor_IncInputEvent();
 
     /* 首次进入全屏重绘 */
@@ -310,43 +332,70 @@ void app_music_run(key_state_t *key)
         return;
     }
 
-    /* ---- 曲目选择 ---- */
-    if (e_up && sel_track > 0)
-    {
-        sel_track--;
-        draw_track_list();
-    }
-    if (e_down && sel_track < Music_GetTrackCount() - 1)
-    {
-        sel_track++;
-        draw_track_list();
-    }
-
-    /* ---- OK: 播放/暂停 (通过队列发命令给 MusicTask) ---- */
+    /* ---- OK 按下: 记录时刻 ---- */
     if (e_ok)
     {
-        music_state_t st = Music_GetState();
-        if (st == MUSIC_PLAYING)
-        {
-            MusicTask_SendCmd(MUSIC_CMD_PAUSE, 0, 0);
-        }
-        else if (st == MUSIC_PAUSED)
-        {
-            MusicTask_SendCmd(MUSIC_CMD_RESUME, 0, 0);
-        }
-        else  /* IDLE 或 FINISHED */
-        {
-            MusicTask_SendCmd(MUSIC_CMD_LOAD, sel_track, 0);
-            MusicTask_SendCmd(MUSIC_CMD_PLAY, 0, 0);
-        }
-        need_info_update = 1;
+        ok_press_tick = xTaskGetTickCount();
+        ok_was_pressed = 1;
     }
 
-    /* ---- 编码器按压: 停止 ---- */
-    if (e_ecsw)
+    /* ---- OK 释放: 判断长短按 ---- */
+    if (ok_released && ok_was_pressed)
     {
-        MusicTask_SendCmd(MUSIC_CMD_STOP, 0, 0);
-        need_info_update = 1;
+        uint32_t hold_ms = (xTaskGetTickCount() - ok_press_tick) * portTICK_PERIOD_MS;
+        ok_was_pressed = 0;
+
+        if (hold_ms >= OK_LONG_PRESS_MS)
+        {
+            /* 长按: 停止播放 */
+            MusicTask_SendCmd(MUSIC_CMD_STOP, 0, 0);
+            need_info_update = 1;
+        }
+        else
+        {
+            /* 短按: Play/Pause */
+            if (st == MUSIC_PLAYING)
+                MusicTask_SendCmd(MUSIC_CMD_PAUSE, 0, 0);
+            else if (st == MUSIC_PAUSED)
+                MusicTask_SendCmd(MUSIC_CMD_RESUME, 0, 0);
+            else  /* IDLE 或 FINISHED */
+            {
+                MusicTask_SendCmd(MUSIC_CMD_LOAD, sel_track, 0);
+                MusicTask_SendCmd(MUSIC_CMD_PLAY, 0, 0);
+            }
+            need_info_update = 1;
+        }
+    }
+
+    /* ---- UP/DOWN: 播放中切歌 / 非播放选曲 ---- */
+    if (is_playing)
+    {
+        if (e_up)
+        {
+            if (sel_track > 0)
+                play_track(sel_track - 1);
+            need_info_update = 1;
+        }
+        if (e_down)
+        {
+            if (sel_track < Music_GetTrackCount() - 1)
+                play_track(sel_track + 1);
+            need_info_update = 1;
+        }
+    }
+    else
+    {
+        /* 非播放状态: UP/DOWN 移动光标选曲 */
+        if (e_up && sel_track > 0)
+        {
+            sel_track--;
+            draw_track_list();
+        }
+        if (e_down && sel_track < Music_GetTrackCount() - 1)
+        {
+            sel_track++;
+            draw_track_list();
+        }
     }
 
     /* ---- 编码器旋转: 音量 ---- */
@@ -379,12 +428,13 @@ void app_music_run(key_state_t *key)
     /* ---- 增量刷新信息区(只重绘变化部分, 避免闪烁) ---- */
     draw_info_dynamic();
 
+    (void)need_info_update;
     prev_key = *key;
 }
 
 void app_music_pause(void)
 {
-    /* 被切换走:停止播放,避免后台发声 */
-    MusicTask_SendCmd(MUSIC_CMD_STOP, 0, 0);
+    /* 最小化/切换走时不停止播放，音乐继续后台播放
+     * 仅在 BACK 退出时才停止（见 app_music_run 中的 BACK 处理） */
     need_redraw = 1;
 }

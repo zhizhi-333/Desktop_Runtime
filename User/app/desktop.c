@@ -53,9 +53,20 @@
 #define CLR_ICON_SEL    BLUE
 #define CLR_ICON_BORDER WHITE
 #define CLR_STATUS      GREEN
+#define CLR_TASKBAR_BG  BLACK
+#define CLR_TASKBAR_ICON_BG GRAY
+#define CLR_TASKBAR_ICON_SEL BLUE
+#define CLR_TASKBAR_ICON_FG  WHITE
 
 /* ---- 状态栏 ---- */
 #define STATUS_Y        295
+
+/* ---- 任务栏（最小化应用图标区，状态栏上方） ---- */
+#define TASKBAR_Y       275
+#define TASKBAR_H       20
+#define TASKBAR_ICON_W  70
+#define TASKBAR_ICON_X0 10
+#define TASKBAR_ICON_GAP 5
 
 /* ---- 模块状态 ---- */
 static int16_t cursor_x, cursor_y;
@@ -65,6 +76,7 @@ static int need_redraw;
 static int last_sec = -1;           /* 上次显示的秒数(检测变化) */
 static int last_id_conn = -1;       /* 上次输入设备状态 */
 static uint32_t last_err_flags = 0xFFFFFFFF; /* 上次错误标志(初始值故意不同以触发首次刷新) */
+static int last_minimized_cnt = -1; /* 上次最小化应用数(检测任务栏变化) */
 
 /* ---- 拖动状态 ---- */
 static int drag_active = 0;         /* 是否正在拖动图标 */
@@ -111,7 +123,7 @@ static void set_icon_pos(int idx, int16_t x, int16_t y)
     if (x < 0) x = 0;
     if (y < 30) y = 30;  /* 避开顶部标题区 */
     if (x + ICON_W > SCR_W) x = SCR_W - ICON_W;
-    if (y + ICON_H > STATUS_Y - 1) y = STATUS_Y - 1 - ICON_H;
+    if (y + ICON_H > TASKBAR_Y - 1) y = TASKBAR_Y - 1 - ICON_H;
     icon_pos_x[idx] = x;
     icon_pos_y[idx] = y;
 }
@@ -141,6 +153,9 @@ static void draw_icon(int idx, int selected)
     }
 }
 
+/* 前向声明 */
+static void draw_taskbar(void);
+
 /* ---- 画整个桌面 ---- */
 static void draw_desktop(void)
 {
@@ -155,6 +170,55 @@ static void draw_desktop(void)
     count = AppManager_GetAppCount();
     for (i = 0; i < count; i++)
         draw_icon(i, 0);
+
+    /* 任务栏 */
+    draw_taskbar();
+}
+
+/* ---- 画任务栏（最小化应用图标区） ---- */
+static void draw_taskbar(void)
+{
+    int i, cnt;
+
+    cnt = AppManager_GetMinimizedCount();
+
+    /* 清除任务栏区域 */
+    LCD_Fill(0, TASKBAR_Y, SCR_W - 1, STATUS_Y - 1, CLR_TASKBAR_BG);
+
+    /* 顶部分隔线 */
+    LCD_Fill(0, TASKBAR_Y, SCR_W - 1, TASKBAR_Y, CLR_TITLE);
+
+    /* 无最小化应用时不画图标，但显示提示 */
+    if (cnt == 0)
+    {
+        GUI_DrawString(180, TASKBAR_Y + 4, "[taskbar empty]", GRAY, CLR_TASKBAR_BG, 1);
+        return;
+    }
+
+    /* 画每个最小化应用图标 */
+    for (i = 0; i < MAX_MINIMIZED; i++)
+    {
+        int app_idx = AppManager_GetMinimizedApp(i);
+        if (app_idx >= 0)
+        {
+            const app_entry_t *app = AppManager_GetApp(app_idx);
+            uint16_t x = TASKBAR_ICON_X0 + i * (TASKBAR_ICON_W + TASKBAR_ICON_GAP);
+            uint16_t bg = CLR_TASKBAR_ICON_BG;
+            char label[16];
+
+            /* 图标背景 + 边框 */
+            LCD_Fill(x, TASKBAR_Y + 2, x + TASKBAR_ICON_W - 1, STATUS_Y - 2, bg);
+            GUI_DrawRect(x, TASKBAR_Y + 2, TASKBAR_ICON_W, TASKBAR_H - 3, CLR_ICON_BORDER);
+
+            /* 应用名（截断显示） */
+            if (app)
+            {
+                snprintf(label, sizeof(label), "[%d]%s", i + 1, app->name);
+                GUI_DrawString(x + 4, TASKBAR_Y + 5, label,
+                               CLR_TASKBAR_ICON_FG, bg, 1);
+            }
+        }
+    }
 }
 
 /* ---- 画状态栏 ---- */
@@ -238,6 +302,10 @@ static void restore_cursor_area(int16_t cx, int16_t cy)
     if (rect_overlap(x1, y1, x2, y2, 0, STATUS_Y, SCR_W - 1, SCR_H - 1))
         draw_status_bar(1);
 
+    /* 任务栏 */
+    if (rect_overlap(x1, y1, x2, y2, 0, TASKBAR_Y, SCR_W - 1, STATUS_Y - 1))
+        draw_taskbar();
+
     /* 图标 */
     count = AppManager_GetAppCount();
     for (i = 0; i < count; i++)
@@ -263,6 +331,27 @@ static int cursor_on_icon(int *idx)
         {
             *idx = i;
             return 1;
+        }
+    }
+    return 0;
+}
+
+/* ---- 检测光标在哪个任务栏图标上 ---- */
+static int cursor_on_taskbar_icon(int *slot)
+{
+    int i;
+    for (i = 0; i < MAX_MINIMIZED; i++)
+    {
+        int app_idx = AppManager_GetMinimizedApp(i);
+        if (app_idx >= 0)
+        {
+            uint16_t x = TASKBAR_ICON_X0 + i * (TASKBAR_ICON_W + TASKBAR_ICON_GAP);
+            if (cursor_x >= x && cursor_x < x + TASKBAR_ICON_W &&
+                cursor_y >= TASKBAR_Y + 2 && cursor_y < STATUS_Y - 1)
+            {
+                *slot = i;
+                return 1;
+            }
         }
     }
     return 0;
@@ -307,8 +396,20 @@ int Desktop_Run(key_state_t *key)
         prev_cy = cursor_y;
         last_sec = -1;
         last_id_conn = -1;
+        last_minimized_cnt = AppManager_GetMinimizedCount();
         prev_key = *key;
         return -1;
+    }
+
+    /* 任务栏变化检测：最小化应用数量变化时重绘任务栏 */
+    {
+        int cur_cnt = AppManager_GetMinimizedCount();
+        if (cur_cnt != last_minimized_cnt)
+        {
+            draw_taskbar();
+            last_minimized_cnt = cur_cnt;
+            draw_cursor(cursor_x, cursor_y);
+        }
     }
 
     /* 状态栏定期刷新：
@@ -398,7 +499,7 @@ int Desktop_Run(key_state_t *key)
             if (!drag_moved)
             {
                 /* 没移动 → 当作点击：启动应用 */
-                new_sel = drag_icon_idx;
+                new_sel = drag_icon_idx + MAX_MINIMIZED;  /* 偏移以区分任务栏 */
                 drag_active = 0;
                 drag_icon_idx = -1;
                 prev_key = *key;
@@ -409,6 +510,16 @@ int Desktop_Run(key_state_t *key)
                 /* 移动过 → 结束拖动，保持新位置 */
                 drag_active = 0;
                 drag_icon_idx = -1;
+            }
+        }
+        else
+        {
+            /* 非拖动状态下 OK 释放：检查是否点击了任务栏图标 */
+            int tb_slot = -1;
+            if (cursor_on_taskbar_icon(&tb_slot))
+            {
+                prev_key = *key;
+                return tb_slot;  /* 返回 0~MAX_MINIMIZED-1，表示恢复最小化应用 */
             }
         }
     }

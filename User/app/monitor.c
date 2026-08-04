@@ -325,6 +325,10 @@ static void InputTask(void *arg)
     {
         Key_Scan(&key);
 
+        /* 心跳上报(放在循环开头,确保熄屏/唤醒等 continue 分支也能喂心跳,
+         * 否则看门狗会误判 InputTask 卡死触发复位) */
+        Monitor_Heartbeat(HB_INPUT);
+
         /* ---- 编码器旋转检测 ---- */
         {
             uint16_t cur_cnt = __HAL_TIM_GET_COUNTER(&htim4);
@@ -485,7 +489,6 @@ static void InputTask(void *arg)
         }
 
         prev_key = key;
-        Monitor_Heartbeat(HB_INPUT);
         vTaskDelay(pdMS_TO_TICKS(20));
     }
 }
