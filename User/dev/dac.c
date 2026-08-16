@@ -69,7 +69,12 @@ static void tim6_init(void)
     __HAL_RCC_TIM6_CLK_ENABLE();
 
     htim6.Instance = TIM6;
-    htim6.Init.Prescaler = 0;
+    /* 预分频 83: 定时器时钟 = 84MHz/(83+1) = 1MHz
+     * 用 1MHz 是为了让低频音符的 ARR 落在 16 位内:
+     *   arr = 1MHz / (2*freq): 131Hz->3816, 262Hz->1908, 440Hz->1136, 1047Hz->477
+     * 原来 Prescaler=0(84MHz) 时, 低于 ~641Hz 的音符 arr>65535 被钳位,
+     * 导致旋律里所有音符都变成同一个 ~641Hz 单调蜂鸣(有声音没旋律) */
+    htim6.Init.Prescaler = 83;
     htim6.Init.CounterMode = TIM_COUNTERMODE_UP;
     htim6.Init.Period = 1000;        /* 默认值, SetFreq 会修改 */
     htim6.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
@@ -132,15 +137,15 @@ void DAC_SetFreq(uint32_t freq)
     }
 
     /* 方波频率 = TIM6 触发频率 / 2
-     * TIM6 频率 = 84MHz / (Prescaler+1) / (Period+1)
-     * 触发频率 = 2 * freq
-     * 简化: Prescaler=0, Period = 84MHz / (2 * freq) - 1 */
+     * TIM6 定时器时钟 = 84MHz / (Prescaler+1) = 84MHz/84 = 1MHz (见 tim6_init)
+     * 触发频率 = 2 * freq, 故 ARR = 1MHz / (2 * freq)
+     * 1MHz 下所有音符(131~1047Hz)的 ARR(477~3816)都在 16 位内, 不再被钳位 */
     if (freq < 100) freq = 100;
     if (freq > 5000) freq = 5000;
 
-    arr = 84000000UL / (2 * freq);
+    arr = 1000000UL / (2 * freq);
     if (arr == 0) arr = 1;
-    if (arr > 65535) arr = 65535;
+    if (arr > 65535) arr = 65535;   /* 安全兜底: 1MHz 下实际不会触发 */
 
     /* ARR 寄存器写入是原子的,且 TIM6 有 preload,无需加锁 */
     __HAL_TIM_SET_AUTORELOAD(&htim6, arr - 1);
