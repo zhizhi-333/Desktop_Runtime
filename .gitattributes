@@ -1,0 +1,22 @@
+# 统一行尾: 仓库内统一 LF, 检出时按平台转换(Windows=CRLF)
+# 解决跨平台 CRLF/LF 假修改问题(开发日志 8.1 记录)
+* text=auto
+
+# 明确文本类型
+*.c        text
+*.h        text
+*.s        text
+*.uvprojx  text
+*.uvoptx   text
+*.ioc      text
+*.md       text
+*.txt      text
+*.gitignore text
+*.hex      binary
+*.axf      binary
+*.o        binary
+*.d        binary
+*.crf      binary
+*.lib      binary
+*.pdf      binary
+*.docx     binary
