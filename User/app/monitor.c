@@ -18,8 +18,12 @@
 #include "file_sys.h"
 #include "file_task.h"
 #include "music_task.h"
+#include "ota.h"
 #include <stdio.h>
 #include <string.h>
+
+/* main.h 未声明 SystemClock_Config, 在此处 extern 避免 Stop 唤醒后恢复时钟时的隐式声明警告 */
+extern void SystemClock_Config(void);
 
 static TaskHandle_t monitor_task_handle;
 static TaskHandle_t led_task_handle;
@@ -95,6 +99,92 @@ static void backlight_on(void)
     LogStore_ScreenEvent(1);
     Log_Printf("[SCREEN] backlight on, brightness=%u\r\n",
                (unsigned)Settings_Brightness());
+}
+
+/* ============================================================
+ * 低功耗 Stop 模式 (熄屏后降低主控功耗)
+ *
+ * 唤醒源 (EXTI 下降沿):
+ *   - 4 根矩阵列线 PE4/PE5/PE7/PE8 (任一按键按下拉低对应列线)
+ *   - 编码器按键 PB8 (ECN_SW)
+ *
+ * 实现要点:
+ *   1. 配 4 行线为输出低, 让任一按键按下时拉低对应列线触发 EXTI
+ *   2. 配 EXTI 下降沿 + NVIC 优先级 5 (FreeRTOS 兼容)
+ *   3. HAL_PWR_EnterSTOPMode 进 Stop (主控 1.2V 域保留, 外设停)
+ *   4. 唤醒后 Key_Init 恢复 GPIO 为扫描模式
+ *   5. SystemClock_Config 恢复时钟 (Stop 唤醒默认 HSI 16MHz)
+ *
+ * 注意:
+ *   - Stop 期间 SysTick 停, FreeRTOS tick 错位 (定时变长但不影响功能)
+ *   - Stop 期间 IWDG 仍跑, 进 Stop 前喂狗避免超时复位
+ *   - Stop 期间音乐/DAC 停止 (熄屏=不用, 合理行为)
+ * ============================================================ */
+static void enter_stop_with_wakeup(void)
+{
+    GPIO_InitTypeDef gpio = {0};
+
+    /* 喂狗: 防止 Stop 期间 IWDG 超时复位 */
+    HAL_IWDG_Refresh(&hiwdg);
+
+    /* 1. 配 4 行线为输出低, 让任一按键按下触发对应列线 EXTI */
+    gpio.Mode = GPIO_MODE_OUTPUT_PP;
+    gpio.Pull = GPIO_NOPULL;
+    gpio.Speed = GPIO_SPEED_FREQ_LOW;
+    gpio.Pin = KEY_ROW0_Pin | KEY_ROW1_Pin | KEY_ROW2_Pin | KEY_ROW3_Pin;
+    HAL_GPIO_Init(GPIOE, &gpio);
+    HAL_GPIO_WritePin(GPIOE,
+        KEY_ROW0_Pin | KEY_ROW1_Pin | KEY_ROW2_Pin | KEY_ROW3_Pin,
+        GPIO_PIN_RESET);
+
+    /* 2. 配 4 列线 + ECN_SW 为 EXTI 下降沿唤醒 */
+    gpio.Mode = GPIO_MODE_IT_FALLING;
+    gpio.Pull = GPIO_PULLUP;
+    gpio.Speed = GPIO_SPEED_FREQ_LOW;
+    gpio.Pin = KEY_COL0_Pin | KEY_COL1_Pin | KEY_COL2_Pin | KEY_COL3_Pin;
+    HAL_GPIO_Init(GPIOE, &gpio);
+    gpio.Pin = KEY_ECSW_Pin;
+    HAL_GPIO_Init(GPIOB, &gpio);
+
+    /* 3. 配 NVIC EXTI (优先级 5, FreeRTOS 兼容) */
+    HAL_NVIC_SetPriority(EXTI4_IRQn, 5, 0);
+    HAL_NVIC_EnableIRQ(EXTI4_IRQn);
+    HAL_NVIC_SetPriority(EXTI9_5_IRQn, 5, 0);
+    HAL_NVIC_EnableIRQ(EXTI9_5_IRQn);
+
+    /* 4. 清除可能的 pending flag (避免上次中断残留立即触发) */
+    __HAL_GPIO_EXTI_CLEAR_FLAG(KEY_COL0_Pin | KEY_COL1_Pin |
+                               KEY_COL2_Pin | KEY_COL3_Pin | KEY_ECSW_Pin);
+
+    /* 5. 进入 Stop 模式 (低功耗稳压器, WFI 等中断唤醒) */
+    HAL_PWR_EnterSTOPMode(PWR_LOWPOWERREGULATOR_ON, PWR_STOPENTRY_WFI);
+
+    /* === 唤醒后从这里继续 === */
+
+    /* 6. 关 EXTI, Key_Init 恢复 GPIO 为扫描模式 (行线输出高, 列线输入上拉) */
+    HAL_NVIC_DisableIRQ(EXTI4_IRQn);
+    HAL_NVIC_DisableIRQ(EXTI9_5_IRQn);
+    Key_Init();
+
+    /* 7. 恢复系统时钟 (Stop 唤醒默认 HSI 16MHz, 需重配 PLL 到 168MHz) */
+    SystemClock_Config();
+
+    Log_Printf("[PWR] wake up from STOP\r\n");
+}
+
+/* EXTI4 中断: PE4 (KEY_COL0) 唤醒, 仅清除 pending flag */
+void EXTI4_IRQHandler(void)
+{
+    __HAL_GPIO_EXTI_CLEAR_FLAG(KEY_COL0_Pin);
+}
+
+/* EXTI9_5 中断: PE5/PE7/PE8 + PB8 (KEY_ECSW) 唤醒, 清除 pending flag */
+void EXTI9_5_IRQHandler(void)
+{
+    if (__HAL_GPIO_EXTI_GET_FLAG(KEY_COL1_Pin)) __HAL_GPIO_EXTI_CLEAR_FLAG(KEY_COL1_Pin);
+    if (__HAL_GPIO_EXTI_GET_FLAG(KEY_COL2_Pin)) __HAL_GPIO_EXTI_CLEAR_FLAG(KEY_COL2_Pin);
+    if (__HAL_GPIO_EXTI_GET_FLAG(KEY_COL3_Pin)) __HAL_GPIO_EXTI_CLEAR_FLAG(KEY_COL3_Pin);
+    if (__HAL_GPIO_EXTI_GET_FLAG(KEY_ECSW_Pin)) __HAL_GPIO_EXTI_CLEAR_FLAG(KEY_ECSW_Pin);
 }
 
 /* ---- eTaskState 转字符（R=Running r=Ready B=Blocked S=Suspended D=Deleted） ---- */
@@ -306,6 +396,8 @@ static void InputTask(void *arg)
                 Log_Printf("[INPUT] SD card init OK, files=%d\r\n", FileSys_GetCount());
                 /* SD 就绪后从 SD 加载历史日志恢复到 RAM(启动阶段无并发) */
                 LogStore_LoadFromSD();
+                /* OTA 保护: 检查 SD 卡是否有待验证的更新镜像 */
+                OTA_CheckPendingUpdate();
             }
         }
         else
@@ -345,6 +437,10 @@ static void InputTask(void *arg)
          * 不含编码器旋转（旋转没有"释放"概念） */
         if (waking_up)
         {
+            /* 限流: 唤醒等待期间的帧间事件被丢弃(按键未释放或编码器仍在转),
+             * 计入 dropped 计数器, 反映"等待期间输入被抑制"压力 */
+            if (has_any_activity(&key) && !has_key_release_activity(&key))
+                Monitor_IncDroppedEvent();
             if (!has_key_release_activity(&key))
                 waking_up = 0;
             /* 唤醒期间继续推进应用后台(音乐等) */
@@ -380,6 +476,11 @@ static void InputTask(void *arg)
                     state = SYS_RUNTIME;
                     Log_Printf("[INPUT] wakeup -> runtime\r\n");
                 }
+            }
+            else
+            {
+                /* 无按键活动: 进 Stop 模式降低主控功耗, 任一矩阵键或 ECN_SW EXTI 唤醒 */
+                enter_stop_with_wakeup();
             }
             prev_key = key;
             vTaskDelay(pdMS_TO_TICKS(20));
