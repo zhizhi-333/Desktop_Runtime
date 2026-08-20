@@ -632,6 +632,11 @@
               <FilePath>..\User\app\log_store.c</FilePath>
             </File>
             <File>
+              <FileName>ota.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\User\app\ota.c</FilePath>
+            </File>
+            <File>
               <FileName>app_log.c</FileName>
               <FileType>1</FileType>
               <FilePath>..\User\app\app_log.c</FilePath>

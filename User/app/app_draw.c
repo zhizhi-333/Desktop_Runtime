@@ -284,6 +284,17 @@ void app_draw_start(void)
     {
         draw_loaded = 0;
         open_requested = 0;
+        /* 修复: 跳过 OK 长按清空检测, 防止用户在 FILE 应用按 OK 调起 DRAW 时
+         * OK 键尚未释放被误判为长按清空, 把刚加载的画图清掉。
+         *
+         * 两步组合缺一不可:
+         *  1) ok_long_triggered=1  让 app_draw_run 第二段长按检测直接跳过
+         *  2) prev_key.ok=1        让第一帧的 OK 边沿检测 (key->ok && !prev_key.ok)
+         *                          返回 false, 避免重新设 ok_long_triggered=0
+         *                          覆盖第 1 步的修复。
+         * 用户松开 OK 键后再按下时, OK 边沿检测正常触发, 长按检测恢复工作。 */
+        ok_long_triggered = 1;
+        prev_key.ok = 1;
     }
 
     /* 首次进入：从 SD 卡加载保存的画图 */

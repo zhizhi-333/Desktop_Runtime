@@ -479,8 +479,15 @@ static void InputTask(void *arg)
             }
             else
             {
-                /* 无按键活动: 进 Stop 模式降低主控功耗, 任一矩阵键或 ECN_SW EXTI 唤醒 */
-                enter_stop_with_wakeup();
+                /* Stop 模式已禁用: EXTI 唤醒不可靠(STM32 内部弱上拉 30-50kΩ 不足
+                 * 以让矩阵按键可靠拉低列线触发下降沿), 矩阵键盘无法唤醒,
+                 * 违背题目"任意键唤醒"要求。退化为 InputTask 20ms 周期扫描唤醒,
+                 * 熄屏靠 PWM 占空比 0 真灭屏(主控仍跑, 不进 Stop)。
+                 *
+                 * enter_stop_with_wakeup 函数保留备用, 未来硬件改造(外加 10kΩ
+                 * 下拉到地、或改用 EXTI 上升沿+行线输出高+列线下拉)后可重新启用。
+                 */
+                /* enter_stop_with_wakeup(); -- disabled, 见上方注释 */
             }
             prev_key = key;
             vTaskDelay(pdMS_TO_TICKS(20));
