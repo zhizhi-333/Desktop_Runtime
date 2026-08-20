@@ -2,6 +2,7 @@
 #include "stm32f4xx_hal.h"
 #include "main.h"
 #include "usart.h"
+#include "lcd.h"
 #include "FreeRTOS.h"
 #include "task.h"
 #include "semphr.h"
@@ -193,11 +194,8 @@ int Settings_SetBrightness(uint32_t v)
     if (g_settings.brightness == v) return 1;
     g_settings.brightness = v;
 
-    /* 应用亮度：0=关背光，>0=开背光（当前 GPIO 只有 on/off） */
-    if (v == 0)
-        HAL_GPIO_WritePin(LCD_BL_GPIO_Port, LCD_BL_Pin, GPIO_PIN_RESET);
-    else
-        HAL_GPIO_WritePin(LCD_BL_GPIO_Port, LCD_BL_Pin, GPIO_PIN_SET);
+    /* 应用亮度: 直接设置 PWM 占空比 (0=关背光, 1~100=对应亮度) */
+    LCD_BL_SetBrightness(v);
 
     return 0;
 }

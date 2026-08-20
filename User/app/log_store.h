@@ -40,8 +40,26 @@ typedef struct {
 /* 日志最大条数 */
 #define LOG_MAX_ENTRIES     32
 
+/* ---- SD 持久化布局 ----
+ * 预留专用块区(避开文件表0/文件数据1-16/CRC17/绘图18-57)
+ * 4 块 = 2048B, 容纳整个 log_persist_t 结构(约 1.5KB)
+ * Block 100: 头(magic+write_idx+count) + entries 前段
+ * Block 101~103: entries 剩余部分 */
+#define LOG_BLOCK_START     100u
+#define LOG_BLOCK_COUNT     4u
+
 /* ---- 初始化 ---- */
 void LogStore_Init(void);
+
+/* ---- SD 持久化接口 ----
+ * LogStore_Persist:      把 RAM 日志批量写回 SD(由 MonitorTask 周期调用)
+ *                        内部 dirty 标志控制, 无变更时立即返回
+ * LogStore_LoadFromSD:   启动时从 SD 读取历史日志恢复到 RAM
+ *                        首次使用(SD 无有效 magic)时保持 RAM 空状态
+ * LogStore_ClearSD:      擦除 SD 上的日志块(配合 LogStore_Clear 使用) */
+void LogStore_Persist(void);
+void LogStore_LoadFromSD(void);
+void LogStore_ClearSD(void);
 
 /* ---- 添加日志（各类专用接口） ---- */
 

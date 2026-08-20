@@ -1,6 +1,8 @@
 #include "file_sys.h"
 #include "stm32f4xx_hal.h"
 #include "usart.h"
+#include "FreeRTOS.h"
+#include "semphr.h"
 #include <string.h>
 #include <stdio.h>
 
@@ -27,6 +29,23 @@ static file_entry_t table[FS_MAX_FILES];
 
 /* ---- 文件表 CRC 损坏标志(load_table 检测到, FileSys_Init 据此重写) ---- */
 static int table_crc_corrupted = 0;
+
+/* ---- SD 块读写互斥量
+ * 保护 FileTask 与 MonitorTask(日志持久化) 的并发 SD 访问
+ * FreeRTOS Mutex 带优先级继承,避免死锁 ---- */
+static SemaphoreHandle_t fs_sd_mutex = NULL;
+
+/* 内部:获取/释放 SD 锁, mutex 为 NULL 时(初始化前)直接放行 */
+static void fs_sd_lock(void)
+{
+    if (fs_sd_mutex != NULL)
+        xSemaphoreTake(fs_sd_mutex, portMAX_DELAY);
+}
+static void fs_sd_unlock(void)
+{
+    if (fs_sd_mutex != NULL)
+        xSemaphoreGive(fs_sd_mutex);
+}
 
 /* ---- 底层块读写前向声明(供 CRC 校验函数使用) ---- */
 static int read_block(uint32_t block, uint8_t *buf);
@@ -108,13 +127,20 @@ static void sdio_gpio_init(void)
 /* ---- 读一个块（512 字节） ---- */
 static int read_block(uint32_t block, uint8_t *buf)
 {
+    int ret;
     if (!sd_ready) return -1;
+    fs_sd_lock();
     if (HAL_SD_ReadBlocks(&hsd, buf, block, 1, 2000) != HAL_OK)
+    {
+        fs_sd_unlock();
         return -1;
+    }
     /* 等待传输完成 */
     while (HAL_SD_GetCardState(&hsd) != HAL_SD_CARD_TRANSFER)
         ;
-    return 0;
+    ret = 0;
+    fs_sd_unlock();
+    return ret;
 }
 
 /* ---- 写一个块（512 字节） ---- */
@@ -122,13 +148,20 @@ static int read_block(uint32_t block, uint8_t *buf)
 static int write_block(uint32_t block, const uint8_t *buf)
 {
     uint8_t tmp[512];
+    int ret;
     if (!sd_ready) return -1;
     memcpy(tmp, buf, 512);
+    fs_sd_lock();
     if (HAL_SD_WriteBlocks(&hsd, tmp, block, 1, 2000) != HAL_OK)
+    {
+        fs_sd_unlock();
         return -1;
+    }
     while (HAL_SD_GetCardState(&hsd) != HAL_SD_CARD_TRANSFER)
         ;
-    return 0;
+    ret = 0;
+    fs_sd_unlock();
+    return ret;
 }
 
 /* ---- 底层块读写公共接口（供画图等应用直接存储数据） ---- */
@@ -281,6 +314,10 @@ int FileSys_Init(void)
     if (fs_inited)
         return sd_ready ? 0 : -1;
     fs_inited = 1;
+
+    /* 创建 SD 互斥量(供 FileTask 与 LogStore 持久化并发使用) */
+    if (fs_sd_mutex == NULL)
+        fs_sd_mutex = xSemaphoreCreateMutex();
 
     sdio_gpio_init();
 

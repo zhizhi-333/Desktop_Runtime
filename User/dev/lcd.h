@@ -63,4 +63,16 @@ void LCD_DrawLine(uint16_t x1, uint16_t y1, uint16_t x2, uint16_t y2);
 void LCD_Fill(uint16_t x1, uint16_t y1, uint16_t x2, uint16_t y2, uint16_t color);
 void LCD_ShowColorBar(void);
 
+/* ============================================================
+ * 背光 PWM 调光（基于 TIM12_CH2, PB15, AF9）
+ *
+ * 替代原 GPIO 开关控制，实现 0~100 级亮度调节
+ * PWM 频率 ~10kHz (人眼不可见, 调光平滑)
+ *
+ * 使用前先调用 LCD_BL_PWM_Init() 初始化, 之后调 LCD_BL_SetBrightness(v)
+ * v: 0=关背光, 1~100=对应占空比 1%~100%
+ * ============================================================ */
+void LCD_BL_PWM_Init(void);
+void LCD_BL_SetBrightness(uint32_t v);
+
 #endif

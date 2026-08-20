@@ -29,15 +29,16 @@ static void LCD_GPIO_Init(void)
 
     __HAL_RCC_GPIOB_CLK_ENABLE();
 
+    /* CS/DC/RST 仍用普通 GPIO 推挽输出
+     * PB15 (LCD_LED) 不在此处初始化, 改由 LCD_BL_PWM_Init 配置为 TIM12_CH2 AF 模式 */
     gpio.Mode = GPIO_MODE_OUTPUT_PP;
     gpio.Pull = GPIO_PULLUP;
     gpio.Speed = GPIO_SPEED_FREQ_MEDIUM;
-    gpio.Pin = LCD_CS_Pin | LCD_DC_Pin | LCD_RST_Pin | LCD_LED_Pin;
+    gpio.Pin = LCD_CS_Pin | LCD_DC_Pin | LCD_RST_Pin;
     HAL_GPIO_Init(GPIOB, &gpio);
 
     LCD_CS_H();
     LCD_RST_H();
-    LCD_LED_ON();
 }
 
 static void LCD_WR_REG(uint8_t cmd)
@@ -221,8 +222,78 @@ void LCD_Init(void)
     LCD_WR_REG(0x29);
 
     LCD_direction(USE_HORIZONTAL);
-    LCD_LED_ON();
+    LCD_BL_PWM_Init();              /* 启动背光 PWM, 默认 100% 亮度 */
     LCD_Clear(WHITE);
+}
+
+/* ============================================================
+ * 背光 PWM 调光实现
+ *
+ * 硬件: PB15 复用为 TIM12_CH2 (AF9)
+ * 时钟: TIM12 在 APB1, 定时器时钟 = 84MHz
+ *       PSC=83 -> 计数时钟 1MHz, ARR=99 -> PWM 频率 10kHz
+ * 占空比: CCR/100, CCR 范围 0~100 对应 0%~100% 亮度
+ *
+ * 默认假设高电平点亮 (与原 LCD_LED_ON()=SET 一致)
+ * 若硬件经 MOSFET 反相, 把 OCMode 改 PWM2 或 OCPolarity 改 LOW 即可
+ * ============================================================ */
+static TIM_HandleTypeDef htim12;
+
+void LCD_BL_PWM_Init(void)
+{
+    GPIO_InitTypeDef gpio = {0};
+    TIM_OC_InitTypeDef oc = {0};
+
+    /* 1. 使能时钟 */
+    __HAL_RCC_TIM12_CLK_ENABLE();
+    /* GPIOB 时钟已在 LCD_GPIO_Init 使能 */
+
+    /* 2. 配置 PB15 为 AF9 (TIM12_CH2) */
+    gpio.Pin = LCD_LED_Pin;                 /* PB15 */
+    gpio.Mode = GPIO_MODE_AF_PP;
+    gpio.Pull = GPIO_NOPULL;
+    gpio.Speed = GPIO_SPEED_FREQ_LOW;
+    gpio.Alternate = GPIO_AF9_TIM12;
+    HAL_GPIO_Init(LCD_LED_Port, &gpio);
+
+    /* 3. 配置 TIM12 时基
+     *    PSC=83 -> 84MHz/(83+1)=1MHz, ARR=99 -> PWM=10kHz */
+    htim12.Instance = TIM12;
+    htim12.Init.Prescaler = 83;
+    htim12.Init.CounterMode = TIM_COUNTERMODE_UP;
+    htim12.Init.Period = 99;
+    htim12.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+    htim12.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
+    if (HAL_TIM_PWM_Init(&htim12) != HAL_OK)
+    {
+        /* PWM 初始化失败: 退化为 GPIO 拉高, 保证屏可见 */
+        GPIO_InitTypeDef g = {0};
+        g.Pin = LCD_LED_Pin;
+        g.Mode = GPIO_MODE_OUTPUT_PP;
+        g.Pull = GPIO_PULLUP;
+        g.Speed = GPIO_SPEED_FREQ_MEDIUM;
+        HAL_GPIO_Init(LCD_LED_Port, &g);
+        HAL_GPIO_WritePin(LCD_LED_Port, LCD_LED_Pin, GPIO_PIN_SET);
+        return;
+    }
+
+    /* 4. 配置 CH2 输出比较 (PWM mode 1: CNT<CCR 时输出高, 高电平点亮) */
+    oc.OCMode = TIM_OCMODE_PWM1;
+    oc.Pulse = 100;                         /* 默认 100% 亮度 */
+    oc.OCPolarity = TIM_OCPOLARITY_HIGH;
+    oc.OCFastMode = TIM_OCFAST_DISABLE;
+    HAL_TIM_PWM_ConfigChannel(&htim12, &oc, TIM_CHANNEL_2);
+
+    /* 5. 启动 PWM 输出 */
+    HAL_TIM_PWM_Start(&htim12, TIM_CHANNEL_2);
+}
+
+void LCD_BL_SetBrightness(uint32_t v)
+{
+    /* 范围限制: 0~100, 超出按 100 处理 */
+    if (v > 100) v = 100;
+    /* CCR=v 直接对应占空比 v% (ARR=99, CCR=100 时全高=100% 占空比) */
+    __HAL_TIM_SET_COMPARE(&htim12, TIM_CHANNEL_2, v);
 }
 
 void LCD_SetWindows(uint16_t x1, uint16_t y1, uint16_t x2, uint16_t y2)

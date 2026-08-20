@@ -80,20 +80,21 @@ static int has_any_activity(const key_state_t *key)
     return has_key_release_activity(key) || enc_active;
 }
 
-/* 关背光 */
+/* 关背光: PWM 占空比设 0, 真灭屏 */
 static void backlight_off(void)
 {
-    HAL_GPIO_WritePin(LCD_BL_GPIO_Port, LCD_BL_Pin, GPIO_PIN_RESET);
+    LCD_BL_SetBrightness(0);
     LogStore_ScreenEvent(0);
     Log_Printf("[SCREEN] backlight off\r\n");
 }
 
-/* 开背光 */
+/* 开背光: 恢复用户设置的亮度 (而不是强制 100%, 尊重用户设置) */
 static void backlight_on(void)
 {
-    HAL_GPIO_WritePin(LCD_BL_GPIO_Port, LCD_BL_Pin, GPIO_PIN_SET);
+    LCD_BL_SetBrightness(Settings_Brightness());
     LogStore_ScreenEvent(1);
-    Log_Printf("[SCREEN] backlight on\r\n");
+    Log_Printf("[SCREEN] backlight on, brightness=%u\r\n",
+               (unsigned)Settings_Brightness());
 }
 
 /* ---- eTaskState 转字符（R=Running r=Ready B=Blocked S=Suspended D=Deleted） ---- */
@@ -303,6 +304,8 @@ static void InputTask(void *arg)
             else
             {
                 Log_Printf("[INPUT] SD card init OK, files=%d\r\n", FileSys_GetCount());
+                /* SD 就绪后从 SD 加载历史日志恢复到 RAM(启动阶段无并发) */
+                LogStore_LoadFromSD();
             }
         }
         else
@@ -623,6 +626,10 @@ static void MonitorTask(void *arg)
                    (unsigned)uxTaskGetStackHighWaterMark(led_task_handle));
 
         Monitor_Heartbeat(HB_MONITOR);  /* 自身心跳 */
+
+        /* 日志持久化: dirty 触发, 无变更时立即返回, 不影响心跳节奏
+         * SD 写入由 file_sys 内的 fs_sd_mutex 保护, 与 FileTask 互斥 */
+        LogStore_Persist();
 
         vTaskDelayUntil(&last, pdMS_TO_TICKS(1000));
     }

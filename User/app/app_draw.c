@@ -49,10 +49,14 @@
 #define PEN_STEP    Settings_CursorSensitivity()
 
 /* ---- 画图数据持久化（SD 卡存储） ---- */
-/* 存储布局: Block 17~56 (40 块, 20480 字节)
+/* 存储布局: Block 18~57 (40 块, 20480 字节)
  *   第一块前 8 字节: magic(4B) + op_count(4B)
- *   后续: draw_op_t 数组 */
-#define DRAW_BLOCK_START    17
+ *   后续: draw_op_t 数组
+ *   注意: 不能用 Block 17 —— 那是文件表 CRC 校验块(FS_BLOCK_TABLE_CRC, 见 file_sys.h)。
+ *         原来用 Block 17 会导致 draw_save 写完绘图头后, 紧接着 FileSys_CreateDraw→
+ *         save_table→save_table_crc 又把 Block 17 覆盖成 CRC, 绘图头被冲掉,
+ *         draw_load 读 Block 17 的 magic 不匹配而判"无数据", 画图加载不出来。 */
+#define DRAW_BLOCK_START    18
 #define DRAW_BLOCK_COUNT    40
 #define DRAW_MAX_OPS        2040    /* (40*512 - 8) / 10 = 2047, 取整 2040 */
 #define DRAW_MAGIC          0x57524144  /* "DRAW" */
