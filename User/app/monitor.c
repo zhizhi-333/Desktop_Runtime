@@ -19,6 +19,7 @@
 #include "file_task.h"
 #include "music_task.h"
 #include "ota.h"
+#include "diag.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -598,6 +599,12 @@ static void InputTask(void *arg)
         {
             AppManager_Run(&key);
         }
+
+        /* === 诊断：按键状态报告 + 心跳 ===
+         * Diag_ReportKey 仅在按键状态变化时发送（不刷屏）
+         * Diag_Tick 每秒发送一次心跳 */
+        Diag_ReportKey(&key);
+        Diag_Tick();
 
         prev_key = key;
         vTaskDelay(pdMS_TO_TICKS(20));

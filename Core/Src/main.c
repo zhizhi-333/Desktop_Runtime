@@ -32,6 +32,7 @@
 #include "encoder.h"
 #include "rtc_time.h"
 #include "file_sys.h"
+#include "diag.h"
 #include "FreeRTOS.h"
 #include "task.h"
 /* USER CODE END Includes */
@@ -104,6 +105,11 @@ int main(void)
   /* 启动 TIM4 编码器模式（MX_TIM4_Init 只配置不启动） */
   Encoder_Init();
   /* USER CODE BEGIN 2 */
+
+  /* === 串口诊断测试（早于 Log_Printf, 排除 Log_Printf 自身问题） ===
+   * 如果串口助手能收到下面的文字，说明 USART3 硬件链路工作正常。
+   * 收不到 → 检查 PD8 是否接到 USB-TTL 模块的 RX + GND 共地 + 波特率 115200 */
+  Diag_TestUART();
 
   /* 串口先打印启动信息（调度器未启动，直接阻塞发送） */
   Log_Printf("\r\n[BOOT] MCU init done, starting FreeRTOS...\r\n");

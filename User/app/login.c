@@ -450,6 +450,10 @@ int Login_Run(key_state_t *key)
     /* 首次进入全屏重绘 */
     if (need_redraw)
     {
+        /* 先更新 prev_key.id_connected，让 draw_select_screen/draw_input_screen
+         * 内部的 draw_sys_status_bar(1) 能读到正确的 id_connected 值。
+         * 只更新 id_connected，不影响 OK/back 等按键的边沿检测。 */
+        prev_key.id_connected = key->id_connected;
         if (ls_state == LS_SELECT)
             draw_select_screen();
         else
@@ -462,13 +466,15 @@ int Login_Run(key_state_t *key)
         last_sys_id = -1;
     }
 
-    /* 系统状态栏定期刷新（秒变化或设备状态变化） */
+    /* 系统状态栏定期刷新（秒变化或设备状态变化）
+     * 注意：只更新 prev_key.id_connected（让 draw_sys_status_bar 读到正确值），
+     * 不整体 prev_key = *key，避免 OK/back 边沿检测失效。 */
     {
         int cur_sec = RTC_GetSecond();
         int cur_id = key->id_connected;
         if (cur_id != last_sys_id)
         {
-            prev_key = *key;
+            prev_key.id_connected = cur_id;  /* 只更新 id_connected，不影响按键边沿 */
             draw_sys_status_bar(1);
             last_sys_sec = cur_sec;
             last_sys_id = cur_id;

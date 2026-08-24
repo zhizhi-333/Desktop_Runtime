@@ -56,6 +56,7 @@ static void scan_matrix(key_state_t *raw)
 
     /* 编码器开关与输入器 ID（非矩阵，直接读取） */
     raw->ec_sw = (HAL_GPIO_ReadPin(KEY_ECSW_GPIO_Port, KEY_ECSW_Pin) == GPIO_PIN_RESET) ? 1 : 0;
+    /* ID 检测：低电平=已连接，高电平=未连接 */
     raw->id_connected = (HAL_GPIO_ReadPin(KEY_IDA_GPIO_Port, KEY_IDA_Pin) == GPIO_PIN_RESET) ? 1 : 0;
 }
 

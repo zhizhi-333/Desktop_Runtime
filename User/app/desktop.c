@@ -421,7 +421,7 @@ int Desktop_Run(key_state_t *key)
         uint32_t cur_err = Monitor_GetError();
         if (cur_id != last_id_conn || cur_err != last_err_flags)
         {
-            prev_key = *key;  /* 让 draw_status_bar 读到新的 id_connected */
+            prev_key.id_connected = cur_id;  /* 只更新 id_connected，不影响按键边沿 */
             draw_status_bar(1);
             last_sec = cur_sec;
             last_id_conn = cur_id;

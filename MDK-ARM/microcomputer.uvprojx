@@ -571,6 +571,16 @@
               <FileType>1</FileType>
               <FilePath>..\User\dev\rtc_time.c</FilePath>
             </File>
+            <File>
+              <FileName>ds1302.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\User\dev\ds1302.c</FilePath>
+            </File>
+            <File>
+              <FileName>diag.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\User\dev\diag.c</FilePath>
+            </File>
           </Files>
         </Group>
         <Group>
