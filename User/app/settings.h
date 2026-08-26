@@ -6,8 +6,15 @@
 /* ============================================================
  * 系统设置 - 全局参数管理 + Flash 掉电保持
  *
- * 存储位置：Flash Sector 11 (0x080E0000)
- * 存储格式：settings_data_t 结构 + magic 校验
+ * 存储位置：双槽冗余
+ *   槽A: Flash Sector 10 (0x080C0000)
+ *   槽B: Flash Sector 11 (0x080E0000)
+ * 存储格式：settings_data_t 结构 + magic + seq + CRC + commit 标记
+ *
+ * 双槽掉电保护:
+ *   保存时写序号较旧的槽: 擦除→写数据+CRC(commit=0)→最后写commit
+ *   启动时两槽都读, 选 commit 有效 + CRC 正确 + 序号最新者
+ *   掉电发生在写入中时, 旧槽仍可用
  * ============================================================ */
 
 /* 默认值 */
@@ -30,7 +37,8 @@
 #define TIMEOUT_MAX       60
 
 /* 设置数据结构（存入 Flash，4 字节对齐）
- * CRC 字段对前面的所有字段做 CRC32 校验，防止掉电导致数据损坏 */
+ * CRC 字段对前面的所有字段做 CRC32 校验，防止掉电导致数据损坏
+ * commit 字段最后单独写入，作为"写入完成"标记 */
 typedef struct {
     uint32_t magic;                 /* 魔数，校验数据有效性 */
     uint32_t cursor_sensitivity;    /* 光标灵敏度（1-20） */
@@ -38,7 +46,9 @@ typedef struct {
     uint32_t brightness;            /* 屏幕亮度（0-100%） */
     uint32_t volume;                /* 系统音量（0-100） */
     uint32_t screen_timeout;        /* 熄屏时间（5-60秒） */
-    uint32_t crc;                   /* CRC32(覆盖 magic..screen_timeout, 不含本字段) */
+    uint32_t seq;                   /* 序号（每次保存递增，启动选最新者） */
+    uint32_t crc;                   /* CRC32(覆盖 magic..seq, 不含本字段和 commit) */
+    uint32_t commit;               /* 提交标记(最后写, SETTINGS_COMMITTED=已提交) */
 } settings_data_t;
 
 /* 初始化设置（从 Flash 读取，无效则用默认值） */

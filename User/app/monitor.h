@@ -126,4 +126,31 @@ void Monitor_WDG_Init(void);
 /* 任务心跳上报(各任务在主循环中调用) */
 void Monitor_Heartbeat(hb_task_id_t id);
 
+/* ============================================================
+ * 复位原因记录 (RTC 备份寄存器)
+ *
+ * 原理:
+ *   - main.c HAL_Init 后调用 Monitor_RecordResetReason()
+ *   - 读 RCC->CSR 判断复位源(IWDG/上电/掉电/软件), 写入 RTC 备份寄存器
+ *   - 清除 CSR 标志(避免下次读到旧值)
+ *   - MonitorTask 启动时读备份寄存器, 补写日志
+ *
+ * 用途: IWDG 复位后日志缓冲丢失, 需在重启后补写"看门狗复位恢复"日志
+ * ============================================================ */
+
+/* 复位原因编码 (写入 RTC 备份寄存器 DR0) */
+#define RESET_REASON_NONE      0   /* 无复位标志(首次或已清除) */
+#define RESET_REASON_POWER      1   /* 上电 POR */
+#define RESET_REASON_PIN       2   /* 复位按键 */
+#define RESET_REASON_SW       3   /* 软件复位 */
+#define RESET_REASON_IWDG      4   /* 独立看门狗复位 */
+#define RESET_REASON_WWDG      5   /* 窗口看门狗复位 */
+#define RESET_REASON_BOR       6   /* 掉电复位 */
+
+/* 记录本次复位原因到 RTC 备份寄存器(在 main.c HAL_Init 后调用一次) */
+void Monitor_RecordResetReason(void);
+
+/* MonitorTask 启动时读取并补写复位原因日志 */
+void Monitor_LogResetReason(void);
+
 #endif /* MONITOR_H */

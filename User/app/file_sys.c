@@ -221,52 +221,104 @@ int FileSys_CreateDraw(const char *name, uint16_t block_addr, uint32_t size)
     return -1;  /* 已满 */
 }
 
-/* ---- 把内存中的文件表写回 SD 卡, 并更新 CRC 校验块 ---- */
+/* ---- 把内存中的文件表写回 SD 卡(双块原子保存) ----
+ * 写入顺序: 主块(0)→CRC块(17)→备份块(58)
+ *
+ * 掉电场景分析:
+ *   写主块中:   主块=损坏, CRC=旧, 备份块=旧 → 主块CRC不匹配 → 备份块+旧CRC匹配 → 恢复 ✅
+ *   写CRC前:    主块=新, CRC=旧 → 主块CRC不匹配 → 备份块=旧+旧CRC匹配 → 恢复(旧数据) ✅
+ *   写CRC后/备份前: 主块=新, CRC=新, 备份块=旧 → 主块CRC匹配 → 用主块 ✅
+ *   写备份块中: 主块=新, CRC=新 → 主块CRC匹配 → 用主块(备份损坏不影响) ✅
+ */
 static int save_table(void)
 {
     uint8_t buf[512];
+    uint32_t crc;
 
     memset(buf, 0, sizeof(buf));
     memcpy(buf, table, sizeof(table));
+    crc = fs_crc32(buf, 512);
+
+    /* 1. 写主块(Block 0): 文件表实际读取位置 */
     if (write_block(FS_BLOCK_TABLE, buf) != 0)
         return -1;
 
-    /* 写入 CRC 校验块(Block 17), 保证文件表掉电可识别 */
-    save_table_crc(fs_crc32(buf, 512));
+    /* 2. 写 CRC 校验块(Block 17): 主块完整性标记
+     * CRC 块对应"最后一次成功写入的主块" */
+    save_table_crc(crc);
+
+    /* 3. 写备份块(Block 58): 主块的副本, 主块损坏时恢复用
+     * 备份块内容=主块, CRC 块同时校验两者(它们内容相同) */
+    if (write_block(FS_BLOCK_TABLE_BAK, buf) != 0)
+    {
+        Log_Printf("[FS] backup block write FAILED\r\n");
+        /* 备份失败不阻塞主流程, 主块已写成功 */
+    }
+
     return 0;
 }
 
-/* ---- 从 SD 卡加载文件表到内存, 并校验 CRC ---- */
+/* ---- 从 SD 卡加载文件表到内存(双块恢复) ----
+ * 读主块+CRC校验, 失败则读备份块+CRC校验恢复
+ * 返回 0=成功, -1=读取失败 */
 static int load_table(void)
 {
     uint8_t buf[512];
+    uint8_t bak_buf[512];
 
+    /* 1. 先读主块 */
     if (read_block(FS_BLOCK_TABLE, buf) != 0)
         return -1;
 
-    /* CRC 校验: 识别掉电/写入不完整导致的文件表损坏 */
+    /* 2. 校验主块 CRC */
     {
         int crc_ret = verify_table_crc(buf);
         if (crc_ret == 0)
         {
-            /* CRC 匹配: 数据完整 */
+            /* CRC 匹配: 主块数据完整 */
             memcpy(table, buf, sizeof(table));
+            return 0;
         }
         else if (crc_ret == 1)
         {
-            /* 无 CRC(首次使用或旧版数据): 正常加载, 后续 save_table 会建立 CRC */
+            /* 无 CRC(首次使用): 正常加载, 后续 save_table 会建立 CRC 和备份 */
             memcpy(table, buf, sizeof(table));
             Log_Printf("[FS] table CRC not present (first use), will create\r\n");
+            return 0;
         }
         else
         {
-            /* CRC 不匹配: 文件表可能损坏, 加载后由 check_table_init 清理异常条目 */
+            /* CRC 不匹配: 主块可能损坏, 尝试从备份块恢复 */
+            Log_Printf("[FS] !!! table CRC mismatch! trying backup block !!!\r\n");
+
+            if (read_block(FS_BLOCK_TABLE_BAK, bak_buf) == 0)
+            {
+                /* 备份块读成功, 用同一个 CRC 块校验
+                 * (备份块内容=主块, CRC 块同时校验两者) */
+                uint32_t bak_crc = fs_crc32(bak_buf, 512);
+                uint8_t crc_blk[512];
+                uint32_t *p = (uint32_t *)crc_blk;
+
+                if (read_block(FS_BLOCK_TABLE_CRC, crc_blk) == 0
+                    && p[0] == FS_TABLE_MAGIC
+                    && p[1] == bak_crc)
+                {
+                    /* 备份块 CRC 匹配: 从备份块恢复 */
+                    memcpy(table, bak_buf, sizeof(table));
+                    Log_Printf("[FS] recovered table from backup block\r\n");
+                    /* 立即重写主块, 让下次启动能直接用主块 */
+                    save_table();
+                    return 0;
+                }
+            }
+
+            /* 备份块也损坏或不存在: 加载主块数据(可能有损坏), 由 check_table_init 清理 */
             memcpy(table, buf, sizeof(table));
             table_crc_corrupted = 1;
-            Log_Printf("[FS] !!! table CRC mismatch! data may be corrupted, sanitizing !!!\r\n");
+            Log_Printf("[FS] !!! backup also corrupted, sanitizing !!!\r\n");
+            return 0;
         }
     }
-    return 0;
 }
 
 /* ---- 检查文件表是否需要初始化 ---- */

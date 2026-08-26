@@ -94,6 +94,11 @@ int main(void)
 
   /* USER CODE BEGIN SysInit */
 
+  /* 记录本次复位原因到 RTC 备份寄存器(IWDG/上电/掉电等)
+   * 必须在调度器启动前读 RCC->CSR, 因为 HAL_RCC 清除标志后无法再读
+   * MonitorTask 启动时会读取备份寄存器补写日志 */
+  Monitor_RecordResetReason();
+
   /* USER CODE END SysInit */
 
   /* Initialize all configured peripherals */

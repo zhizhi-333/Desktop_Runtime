@@ -7,12 +7,16 @@
  * 简易块文件系统（基于 SD 卡裸块读写）
  *
  * SD 卡块布局（每块 512 字节）:
- *   Block 0:   文件表（16 个 file_entry_t，共 512 字节）
+ *   Block 0:   文件表主块（16 个 file_entry_t，共 512 字节）
  *   Block 1:   文件 0 数据（512 字节）
  *   Block 2:   文件 1 数据
  *   ...
  *   Block 16:  文件 15 数据
- *   Block 17:  文件表 CRC 校验块（magic + CRC32，掉电保护）
+ *   Block 17:  文件表 CRC 校验块（magic + CRC32）
+ *   Block 18~57: 绘图数据 (DRAW.BIN, 由 app_draw 使用)
+ *   Block 58:  文件表备份块（原子保存: 主块损坏时恢复）
+ *   Block 100~103: 日志持久化 (由 log_store 使用)
+ *   Block 200~299: OTA 镜像 (由 ota 使用)
  *
  * 限制:
  *   - 最多 16 个文件
@@ -29,17 +33,19 @@
  *   state:       文件状态 (0=正常, 1=只读, 2=隐藏)
  *   reserved:    填充
  *
- * 存储一致性保护:
- *   save_table 写入文件表后, 计算 Block 0 的 CRC32 并写入 Block 17。
- *   load_table 读取后校验 CRC, 不匹配则告警并清理损坏条目, 避免使用损坏数据。
+ * 存储一致性保护(双块原子保存):
+ *   save_table: 先写备份块(58)→写主块(0)→写CRC块(17)
+ *   掉电发生在写主块中: 备份块仍完整, 启动时从备份块恢复
+ *   load_table: 读主块+CRC校验, 失败则读备份块+校验
  * ============================================================ */
 
 #define FS_MAX_FILES        16
 #define FS_FILE_MAX_SIZE    512
 #define FS_NAME_LEN         12      /* "FILE01   TXT" 含结尾 \0 */
-#define FS_BLOCK_TABLE      0       /* 文件表所在块 */
+#define FS_BLOCK_TABLE      0       /* 文件表主块 */
 #define FS_BLOCK_DATA_BASE  1       /* 文件数据起始块 */
-#define FS_BLOCK_TABLE_CRC  17      /* 文件表 CRC 校验块(掉电保护) */
+#define FS_BLOCK_TABLE_CRC  17      /* 文件表 CRC 校验块 */
+#define FS_BLOCK_TABLE_BAK  58      /* 文件表备份块(原子保存) */
 
 /* 文件类型 */
 #define FS_TYPE_TEXT        0       /* 文本文件 */

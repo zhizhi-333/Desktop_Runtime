@@ -267,6 +267,104 @@ void Monitor_Heartbeat(hb_task_id_t id)
         task_heartbeats[id]++;
 }
 
+/* ============================================================
+ * 复位原因记录 (RTC 备份寄存器)
+ *
+ * STM32F4 备份寄存器 (BKP0~BKP19) 在 VBAT 供电下保持,
+ * 不受主电源掉电影响, 适合记录"上次复位原因"
+ *
+ * 访问流程:
+ *   1. 使能 PWR 时钟
+ *   2. PWR->CR.DBP=1 (Disable Backup Protection, 允许写备份域)
+ *   3. 通过 RTC->BKP0R 读写
+ * ============================================================ */
+
+/* ---- 复位原因字符串(供日志) ---- */
+static const char *reset_reason_str(int reason)
+{
+    switch (reason)
+    {
+        case RESET_REASON_POWER: return "Power-on (POR)";
+        case RESET_REASON_PIN:   return "Reset pin";
+        case RESET_REASON_SW:    return "Software";
+        case RESET_REASON_IWDG:   return "IWDG watchdog";
+        case RESET_REASON_WWDG:   return "WWDG watchdog";
+        case RESET_REASON_BOR:    return "Brown-out (BOR)";
+        default:                  return "Unknown/none";
+    }
+}
+
+/* ---- 记录本次复位原因到 RTC 备份寄存器 ----
+ * 在 main.c HAL_Init 之后调用一次
+ * 读 RCC->CSR 判断复位源, 写入 BKP0R, 然后清除 CSR 标志 */
+void Monitor_RecordResetReason(void)
+{
+    uint32_t csr;
+    uint32_t reason = RESET_REASON_NONE;
+
+    /* 使能 PWR 时钟 + 后备域访问 */
+    __HAL_RCC_PWR_CLK_ENABLE();
+    HAL_PWR_EnableBkUpAccess();
+
+    csr = RCC->CSR;
+
+    /* 按优先级判断 (看门狗优先记录, 因为最需要诊断) */
+    if (csr & RCC_CSR_IWDGRSTF)
+        reason = RESET_REASON_IWDG;
+    else if (csr & RCC_CSR_WWDGRSTF)
+        reason = RESET_REASON_WWDG;
+    else if (csr & RCC_CSR_SFTRSTF)
+        reason = RESET_REASON_SW;
+    else if (csr & RCC_CSR_PORRSTF)
+        reason = RESET_REASON_POWER;
+    else if (csr & RCC_CSR_PADRSTF)
+        reason = RESET_REASON_PIN;
+    else if (csr & RCC_CSR_BORRSTF)
+        reason = RESET_REASON_BOR;
+
+    /* 写入备份寄存器(只在检测到复位标志时写) */
+    if (reason != RESET_REASON_NONE)
+    {
+        /* STM32F4: 直接写 RTC->BKP0R (后备域访问已使能) */
+        RTC->BKP0R = reason;
+    }
+
+    /* 清除所有复位标志, 避免下次启动读到旧值 */
+    __HAL_RCC_CLEAR_RESET_FLAGS();
+}
+
+/* ---- MonitorTask 启动时读取并补写复位原因日志 ----
+ * 读 BKP0R 后立即清零, 避免重复记录 */
+void Monitor_LogResetReason(void)
+{
+    uint32_t reason;
+
+    __HAL_RCC_PWR_CLK_ENABLE();
+    HAL_PWR_EnableBkUpAccess();
+
+    reason = RTC->BKP0R;
+
+    if (reason != RESET_REASON_NONE && reason <= RESET_REASON_BOR)
+    {
+        /* 补写日志: 记录上次复位原因 */
+        Log_Printf("[SYS] === last reset reason: %s ===\r\n", reset_reason_str((int)reason));
+
+        if (reason == RESET_REASON_IWDG || reason == RESET_REASON_WWDG)
+        {
+            /* 看门狗复位 = 任务卡死, 记录错误事件并设置错误标志 */
+            Monitor_SetError(SYS_ERR_TASK_HANG);
+            LogStore_Error("Watchdog reset recovery");
+        }
+        else
+        {
+            LogStore_Info(reset_reason_str((int)reason));
+        }
+
+        /* 清除备份寄存器, 避免重复记录 */
+        RTC->BKP0R = 0;
+    }
+}
+
 void Monitor_IncInputEvent(void)    { evt_input++; }
 void Monitor_IncDroppedEvent(void)  { evt_dropped++; }
 void Monitor_IncError(void)         { evt_error++; }
@@ -552,9 +650,18 @@ static void InputTask(void *arg)
                        key.id_connected);
             /* 更新错误标志：设备断开时设置，恢复时清除 */
             if (key.id_connected)
+            {
                 Monitor_ClearError(SYS_ERR_INPUT);
+            }
             else
+            {
                 Monitor_SetError(SYS_ERR_INPUT);
+                /* 断连时合成所有按键释放事件: 强制清零按键位
+                 * 避免拖动中(OK按住+方向移动)断连导致应用卡在"按下"状态
+                 * 后续 Login_Run/AppManager_Run 会读到所有按键释放 */
+                key.up = key.down = key.left = key.right = 0;
+                key.ok = key.back = key.ec_sw = 0;
+            }
         }
 
         /* ---- 正常处理 ---- */
@@ -660,6 +767,9 @@ static void MonitorTask(void *arg)
         prev_hb[i] = task_heartbeats[i];
         hang_seconds[i] = 0;
     }
+
+    /* 读取 RTC 备份寄存器, 补写上次复位原因日志(IWDG 复位后日志丢失, 需补写) */
+    Monitor_LogResetReason();
 
     for (;;)
     {
