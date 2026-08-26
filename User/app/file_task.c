@@ -90,8 +90,12 @@ static void FileTask(void *arg)
         /* 心跳上报(发送响应前,避免队列满阻塞时心跳停滞) */
         Monitor_Heartbeat(HB_FILE);
 
-        /* 发送响应(阻塞等待,因为响应队列必须及时腾空) */
-        xQueueSend(file_resp_queue, &resp, portMAX_DELAY);
+        /* 发送响应(有限超时,防止响应队列满时无限阻塞触发看门狗) */
+        if (xQueueSend(file_resp_queue, &resp, pdMS_TO_TICKS(1000)) != pdTRUE)
+        {
+            Log_Printf("[FILE] resp queue full, dropping response\r\n");
+            /* 队列满时丢弃响应, InputTask 的 FS_WAIT 会超时重试 */
+        }
     }
 }
 

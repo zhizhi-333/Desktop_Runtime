@@ -245,7 +245,11 @@ static int save_table(void)
 
     /* 2. 写 CRC 校验块(Block 17): 主块完整性标记
      * CRC 块对应"最后一次成功写入的主块" */
-    save_table_crc(crc);
+    if (save_table_crc(crc) != 0)
+    {
+        Log_Printf("[FS] CRC block write FAILED\r\n");
+        /* CRC 失败不阻塞主流程, 下次启动会走备份块恢复路径 */
+    }
 
     /* 3. 写备份块(Block 58): 主块的副本, 主块损坏时恢复用
      * 备份块内容=主块, CRC 块同时校验两者(它们内容相同) */
