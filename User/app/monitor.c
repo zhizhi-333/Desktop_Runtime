@@ -519,6 +519,17 @@ static void InputTask(void *arg)
     {
         Key_Scan(&key);
 
+        /* PE6 未接地 = 输入设备未连接, 屏蔽所有按键和编码器输入
+         * 方案 A: 完全屏蔽, 连唤醒屏幕也不响应
+         * id_connected 仍正常传递给 UI 用于状态栏显示 */
+        if (!key.id_connected)
+        {
+            key.up = key.down = key.left = key.right = 0;
+            key.ok = key.back = 0;
+            key.ec_sw = 0;
+            enc_active = 0;
+        }
+
         /* 心跳上报(放在循环开头,确保熄屏/唤醒等 continue 分支也能喂心跳,
          * 否则看门狗会误判 InputTask 卡死触发复位) */
         Monitor_Heartbeat(HB_INPUT);
