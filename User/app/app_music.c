@@ -261,7 +261,7 @@ static void redraw_all(void)
 
     /* 底部提示 */
     LCD_Fill(0, FOOTER_Y, SCR_W - 1, SCR_H - 1, CLR_BG);
-    GUI_DrawString(5, FOOTER_Y,      "OK短:Play/Pause OK长:Stop EC:Vol", CLR_HINT, CLR_BG, 1);
+    GUI_DrawString(5, FOOTER_Y,      "OK S:Play/Pause OK L:Stop EC:Vol", CLR_HINT, CLR_BG, 1);
     GUI_DrawString(5, FOOTER_Y + 14, "EC_SW:Minimize  BACK:Exit", CLR_HINT, CLR_BG, 1);
 }
 

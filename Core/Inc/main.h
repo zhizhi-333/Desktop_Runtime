@@ -94,9 +94,9 @@ void Error_Handler(void);
 #define ECN_B_GPIO_Port GPIOB
 #define ECN_SW_Pin GPIO_PIN_8
 #define ECN_SW_GPIO_Port GPIOB
-/* 板载 LED（PF9） */
-#define LED0_Pin GPIO_PIN_9
-#define LED0_GPIO_Port GPIOF
+/* 板载 LED（PC13） */
+#define LED0_Pin GPIO_PIN_13
+#define LED0_GPIO_Port GPIOC
 
 /* USER CODE BEGIN Private defines */
 

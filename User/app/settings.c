@@ -3,6 +3,7 @@
 #include "main.h"
 #include "usart.h"
 #include "lcd.h"
+#include "dac.h"
 #include "FreeRTOS.h"
 #include "task.h"
 #include "semphr.h"
@@ -350,6 +351,8 @@ int Settings_SetVolume(uint32_t v)
     v = clamp(v, VOLUME_MIN, VOLUME_MAX);
     if (g_settings.volume == v) return 1;
     g_settings.volume = v;
+    /* 同步 DAC 音量，确保 settings 与 music 应用音量一致 */
+    DAC_SetVolume((uint8_t)v);
     return 0;
 }
 
