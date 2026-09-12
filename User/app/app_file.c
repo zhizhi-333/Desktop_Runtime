@@ -8,6 +8,8 @@
 #include "file_task.h"
 #include "app_draw.h"
 #include "log_store.h"
+#include "FreeRTOS.h"
+#include "task.h"
 #include <string.h>
 #include <stdio.h>
 
@@ -108,6 +110,11 @@ static int prev_grid_row, prev_grid_col;  /* 上次位置（局部刷新用） *
 static char name_buf[13];
 static int name_len;
 static int rename_error;            /* 重命名错误标志 */
+
+/* OK 键长按检测(LIST 状态: 短按=打开文件, 长按=重命名) */
+#define OK_LONG_PRESS_MS 600
+static uint32_t ok_press_tick;
+static uint8_t ok_was_pressed;
 
 /* 删除/新建提示 */
 static int msg_timer;               /* 提示消息倒计时 */
@@ -266,9 +273,9 @@ static void draw_list(void)
 
     /* 底部操作提示（分两行，更清晰） */
     LCD_Fill(0, LIST_FOOTER_Y, SCR_W - 1, SCR_H - 1, CLR_BG);
-    GUI_DrawString(5, LIST_FOOTER_Y,      "UP/DN:Select  OK:Open", CLR_HINT, CLR_BG, 1);
-    GUI_DrawString(5, LIST_FOOTER_Y + 14, "LEFT:New  RIGHT:Del", CLR_HINT, CLR_BG, 1);
-    GUI_DrawString(5, LIST_FOOTER_Y + 28, "BACK:Exit", CLR_HINT, CLR_BG, 1);
+    GUI_DrawString(5, LIST_FOOTER_Y,      "OK S:Open  OK L:Rename", CLR_HINT, CLR_BG, 1);
+    GUI_DrawString(5, LIST_FOOTER_Y + 14, "UP/DN:Select  LEFT:New", CLR_HINT, CLR_BG, 1);
+    GUI_DrawString(5, LIST_FOOTER_Y + 28, "RIGHT:Del  BACK:Exit", CLR_HINT, CLR_BG, 1);
 
     /* 提示消息 */
     if (msg_timer > 0)
@@ -284,6 +291,7 @@ static void run_list(key_state_t *key)
     uint8_t e_left  = (!prev_key.left)  && key->left;
     uint8_t e_right = (!prev_key.right) && key->right;
     uint8_t e_ok    = (!prev_key.ok)    && key->ok;
+    uint8_t ok_released = (prev_key.ok) && (!key->ok);
     int count = FileSys_GetCount();
 
     /* 滚动选择 */
@@ -302,42 +310,80 @@ static void run_list(key_state_t *key)
         draw_list();
     }
 
-    /* OK: 打开文件 */
-    if (e_ok && count > 0)
+    /* ---- OK 长按检测: 短按=打开文件, 长按=重命名 ---- */
+    if (e_ok)
     {
-        const file_entry_t *e = FileSys_GetEntry(sel_idx);
+        ok_press_tick = xTaskGetTickCount();
+        ok_was_pressed = 1;
+    }
 
-        /* 绘图文件: 触发 DRAW 应用打开 */
-        if (e && e->type == FS_TYPE_DRAW)
+    /* 长按超过阈值: 立即触发重命名(不等释放) */
+    if (ok_was_pressed && key->ok &&
+        (xTaskGetTickCount() - ok_press_tick) * portTICK_PERIOD_MS >= OK_LONG_PRESS_MS)
+    {
+        ok_was_pressed = 0;  /* 消费, 防止释放时再触发短按 */
+        if (count > 0)
         {
-            app_draw_request_open();
-            AppManager_GotoDesktop();
-            prev_key = *key;
-            return;
-        }
-
-        /* 文本文件: 异步投递 READ 请求 */
-        {
-            file_req_t req;
-            memset(&req, 0, sizeof(req));
-            req.op  = FILE_OP_READ;
-            req.idx = sel_idx;
-            req.buf = content_buf;
-            req.len = FS_FILE_MAX_SIZE;
-
-            if (FileTask_Request(&req, 0))
+            const file_entry_t *e = FileSys_GetEntry(sel_idx);
+            if (e)
             {
-                view_scroll = 0;
-                pending_op = FILE_OP_READ;
-                wait_return = FS_VIEW;
-                wait_param = sel_idx;
-                fs_state = FS_WAIT;
+                /* 初始化 name_buf 为当前文件名, 进入 RENAME 状态 */
+                strncpy(name_buf, e->name, 12);
+                name_buf[12] = 0;
+                name_len = strlen(name_buf);
+                rename_error = 0;
+                grid_row = 0;
+                grid_col = 0;
+                prev_grid_row = 0;
+                prev_grid_col = 0;
+                fs_state = FS_RENAME;
                 need_redraw = 1;
             }
-            else
+        }
+    }
+
+    /* OK 释放: 若未触发长按, 则为短按 = 打开文件 */
+    if (ok_released && ok_was_pressed)
+    {
+        uint32_t hold_ms = (xTaskGetTickCount() - ok_press_tick) * portTICK_PERIOD_MS;
+        ok_was_pressed = 0;
+
+        if (hold_ms < OK_LONG_PRESS_MS && count > 0)
+        {
+            const file_entry_t *e = FileSys_GetEntry(sel_idx);
+
+            /* 绘图文件: 触发 DRAW 应用打开 */
+            if (e && e->type == FS_TYPE_DRAW)
             {
-                show_msg("BUSY!");
-                draw_list();
+                app_draw_request_open();
+                AppManager_GotoDesktop();
+                prev_key = *key;
+                return;
+            }
+
+            /* 文本文件: 异步投递 READ 请求 */
+            {
+                file_req_t req;
+                memset(&req, 0, sizeof(req));
+                req.op  = FILE_OP_READ;
+                req.idx = sel_idx;
+                req.buf = content_buf;
+                req.len = FS_FILE_MAX_SIZE;
+
+                if (FileTask_Request(&req, 0))
+                {
+                    view_scroll = 0;
+                    pending_op = FILE_OP_READ;
+                    wait_return = FS_VIEW;
+                    wait_param = sel_idx;
+                    fs_state = FS_WAIT;
+                    need_redraw = 1;
+                }
+                else
+                {
+                    show_msg("BUSY!");
+                    draw_list();
+                }
             }
         }
     }
