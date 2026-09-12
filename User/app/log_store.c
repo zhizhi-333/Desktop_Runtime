@@ -2,6 +2,7 @@
 #include "monitor.h"
 #include "file_sys.h"
 #include "usart.h"
+#include "rtc_time.h"
 #include "FreeRTOS.h"
 #include "task.h"
 #include "semphr.h"
@@ -60,8 +61,10 @@ static void add_entry_locked(log_type_t type, const char *text)
 {
     log_entry_t *e = &entries[write_idx];
 
-    /* 时间戳（秒） */
-    e->timestamp = (uint32_t)(xTaskGetTickCount() / 1000);
+    /* 时间戳：实时时间 HH*3600 + MM*60 + SS */
+    e->timestamp = (uint32_t)RTC_GetHour() * 3600U
+                 + (uint32_t)RTC_GetMinute() * 60U
+                 + (uint32_t)RTC_GetSecond();
     e->type = type;
 
     /* 复制文本（截断保护） */
